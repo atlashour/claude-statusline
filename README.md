@@ -110,8 +110,9 @@ copying to a new machine. If it passes, the line works.
 Every optional segment is built behind its own guard. Bad data makes that
 segment disappear, not the line. Object-typed fields are read defensively, so a
 field arriving as a string degrades to nothing instead of raising. A failure in
-the core path prints `ctx: n/a`. Stdout is forced to UTF-8, since Windows
-defaults to cp1252 and would otherwise choke on the bar glyphs.
+the core path prints `ctx: n/a`. Stdin and stdout are forced to UTF-8 whether or
+not you pass `-X utf8`, since Windows defaults to cp1252, which would garble
+non-ASCII names on the way in and choke on the bar glyphs on the way out.
 
 Git state is cached for 5 seconds per session, keyed by session id and
 invalidated when the directory changes, so `git status` does not run on every

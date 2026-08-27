@@ -54,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from statusline import VERSION, A, elide, human, num, visible_len
 except Exception:                                    # degrade, never disappear
-    VERSION = "5.0.0"
+    VERSION = "unknown"       # the import is the version source; do not fake one
     A = {k: "" for k in ("reset", "dim", "bold", "green",
                          "yellow", "red", "cyan", "gray")}
 
@@ -178,10 +178,11 @@ def render_rows(d: dict) -> list:
 
 
 def main() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    for stream in (sys.stdin, sys.stdout):     # never depend on -X utf8
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if "--version" in sys.argv[1:]:
         sys.stdout.write(f"subagent-statusline {VERSION}\n")
         return

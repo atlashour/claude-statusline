@@ -70,13 +70,15 @@ at most two short git commands per cache refresh (`status`, plus
 Failure containment is layered: each optional segment (git/dir, limits,
 cost, duration, lines±) is built inside its own guard and silently
 disappears if its data is malformed — one bad field cannot erase the
-gauge; a failure in the core path degrades to "ctx: n/a"; stdout is
-forced to UTF-8 (Windows defaults to cp1252, which would otherwise raise
-on the bar/separator glyphs).
+gauge; a failure in the core path degrades to "ctx: n/a"; stdin and
+stdout are forced to UTF-8 regardless of `-X utf8` (Windows defaults to
+cp1252, which would garble non-ASCII names on the way in and raise on the
+bar/separator glyphs on the way out).
 
 No third-party dependencies; Python 3.7+ (tested on 3.9).
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -86,7 +88,7 @@ from datetime import datetime
 from unicodedata import east_asian_width
 
 # --- Tunables (edit these) ------------------------------------------------
-VERSION       = "5.0.0"  # reported by --version; never drawn on the line
+VERSION       = "5.0.1"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to session_name before eliding
 COMFORT_ABS   = 250_000  # absolute mental-saturation ceiling (tokens)
 COMFORT_FRAC  = 0.80     # ...but never above this fraction of the real window
@@ -109,11 +111,16 @@ _NOWINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" el
 
 
 def num(x, default=0.0):
-    """Coerce a JSON value to float; malformed types fall back, never raise."""
+    """Coerce a JSON value to a finite float; anything else falls back, never raises.
+
+    Infinity and NaN are rejected too: Python's json accepts both literals
+    and int() raises on either, which would take the core path down.
+    """
     try:
-        return float(x)
+        v = float(x)
     except (TypeError, ValueError):
         return default
+    return v if math.isfinite(v) else default
 
 
 def human(n: int) -> str:
@@ -378,10 +385,10 @@ def render(d: dict) -> str:
         return seg
 
     def build_limits() -> str:
-        rl = d.get("rate_limits") or {}
+        rl = obj(d, "rate_limits")
         parts = []
         for tag, key in (("5h", "five_hour"), ("7d", "seven_day")):
-            w = rl.get(key) or {}
+            w = obj(rl, key)                  # one malformed window drops only itself
             pct = num(w.get("used_percentage"), None)
             if pct is None:
                 continue
@@ -453,10 +460,11 @@ def render(d: dict) -> str:
 
 
 def main() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    for stream in (sys.stdin, sys.stdout):     # never depend on -X utf8
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if "--version" in sys.argv[1:]:
         sys.stdout.write(f"statusline {VERSION}\n")
         return

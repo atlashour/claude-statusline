@@ -3,7 +3,7 @@
 
 Run on any machine that carries these scripts:
 
-    python -X utf8 ~/.claude/test_statusline.py
+    python -X utf8 /path/to/claude-statusline/test_statusline.py
 
 Stdlib only (unittest), no third-party dependencies, so it runs wherever
 the status line itself runs. Every test drives the real render path with
@@ -111,10 +111,12 @@ class SessionName(unittest.TestCase):
         self.assertIn("…", out)
 
     def test_truncated_session_name_respects_the_cell_budget(self):
+        # Assert on the name itself, not on the longest word of the whole
+        # line: that made the test depend on the machine's temp dir length.
         name = "x" * 200
         out = strip(render_at(300, session_name=name))
-        longest = max((run for run in out.split(" ")), key=len)
-        self.assertLessEqual(len(longest), statusline.SESSION_MAX)
+        self.assertIn("x" * (statusline.SESSION_MAX - 1) + "…", out)
+        self.assertNotIn("x" * statusline.SESSION_MAX, out)
 
     def test_absent_session_name_leaves_no_empty_separator(self):
         out = strip(render_at(200))
@@ -167,6 +169,21 @@ class FailureContainment(unittest.TestCase):
     def test_wrong_types_for_whole_objects_still_render(self):
         d = payload(model="Opus", effort=[], workspace=None, session_name=42)
         self.assertTrue(statusline.render(d).strip())
+
+    def test_non_finite_numbers_still_render_the_gauge(self):
+        # Python's json accepts Infinity/NaN, and int() raises on both.
+        d = json.loads('{"context_window": {"total_input_tokens": Infinity, '
+                       '"used_percentage": NaN}}')
+        out = strip(statusline.render(d))
+        self.assertIn("ctx", out)
+        self.assertNotIn("n/a", out)
+        self.assertNotIn("nan", out)
+        self.assertNotIn("inf", out)
+
+    def test_malformed_five_hour_keeps_the_seven_day_limit(self):
+        out = strip(render_at(200, rate_limits={
+            "five_hour": "nope", "seven_day": {"used_percentage": 41.2}}))
+        self.assertIn("7d 41%", out)
 
     def test_process_exits_zero_on_garbage_stdin(self):
         r = subprocess.run(
@@ -282,6 +299,33 @@ class SubagentRows(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0)
         self.assertIn(statusline.VERSION, r.stdout)
+
+
+# --- encoding ---------------------------------------------------------------
+
+class Encoding(unittest.TestCase):
+    """Both scripts decode stdin as UTF-8 even when run without `-X utf8`."""
+
+    def run_without_utf8_mode(self, script, data):
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+        env["PYTHONUTF8"] = "0"                # the legacy locale codec (cp1252)
+        r = subprocess.run(
+            [sys.executable, os.path.join(HERE, script)],
+            input=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            capture_output=True, env=env, timeout=10,
+        )
+        self.assertEqual(r.returncode, 0)
+        return r.stdout.decode("utf-8")
+
+    def test_status_line_decodes_stdin_as_utf8(self):
+        out = self.run_without_utf8_mode(
+            "statusline.py", payload(session_name="Álvaro"))
+        self.assertIn("Álvaro", out)
+
+    def test_subagent_rows_decode_stdin_as_utf8(self):
+        out = self.run_without_utf8_mode(
+            "subagent_statusline.py", tasks_payload(a_task(label="Álvaro")))
+        self.assertIn("Álvaro", out)
 
 
 if __name__ == "__main__":
