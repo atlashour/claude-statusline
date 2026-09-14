@@ -1,68 +1,45 @@
 #!/usr/bin/env python3
-"""Subagent status line — one row per visible subagent in the agent panel.
+"""Subagent status line: one row per visible subagent in the agent panel.
 
-Replaces the default `name · description · token count` row with a row that
-answers the question you actually have while agents are running: how close is
-each one to its context limit, and on what model and effort is it running.
+Row, left to right: status (▸ running, · pending, ✓ done, ✗ failed), label, model and
+explicit effort, context gauge against the task's own window, tokens, description.
 
-Row layout, left to right, each part dropped from the right when the row
-does not fit the `columns` budget the harness declares:
+Columns align across the rows of one payload while the panel is wide enough to keep
+MIN_DESC cells of description; otherwise rows pack tightly. Parts drop from the right
+when a row does not fit `columns`, which the harness declares (narrower than the terminal).
 
-    ▸ explore:parser  opus-5 high  ████░░ 24%  48k  locate the tokenizer…
-    │ │               │            │           │    └ description
-    │ │               │            │           └ tokens consumed
-    │ │               │            └ context gauge, coloured by saturation
-    │ │               └ resolved model, and effort when explicitly set
-    │ └ label, falling back to the task name
-    └ status glyph
+The gauge appears only once `contextWindowSize` is present, that is once the task's model
+resolved (Claude Code 2.1.205+); a percentage against a guessed window would mislead.
+Effort appears only when set explicitly (2.1.214+); absent means inherited.
 
-Design notes:
+Styling comes from statusline.py so both share one visual language. If that import fails,
+rows still render as plain text.
 
-1. The context gauge only appears when `contextWindowSize` is present. The
-   harness omits that field (with `model`) until the task's model resolves,
-   and both require Claude Code v2.1.205 or later; a percentage computed
-   against a guessed window would be a confident lie, so there isn't one.
-
-2. `effort` is absent when the subagent inherits the session's effort level,
-   and is either a level string or a numeric token budget. Both render; the
-   absent case renders nothing rather than repeating the session's level,
-   because the field's whole meaning is "this one differs". Requires
-   v2.1.214 or later.
-
-3. Width comes from the `columns` field in the payload, NOT from the COLUMNS
-   environment variable: the harness declares the usable row width here, and
-   it is narrower than the terminal because the panel indents its rows.
-
-4. This module depends on statusline.py for width and formatting helpers so
-   the two lines stay visually identical. The dependency points this way on
-   purpose: the main status line is the critical one and stays self-contained.
-   If the import fails, every helper degrades to a plain-ASCII equivalent and
-   rows still render, uncoloured.
-
-Input: one JSON object on stdin with the base hook fields, `columns`, and a
-`tasks` array. Output: one JSON line per row, {"id": ..., "content": ...}.
-Tasks without an id are skipped, which leaves their default rendering intact.
-
-No third-party dependencies; Python 3.7+.
+Input: JSON on stdin with `columns` and `tasks`. Output: one JSON line per task with an id,
+{"id": ..., "content": ...}; tasks without an id keep their default rendering.
+Python 3.7+, standard library only.
 """
 import json
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from statusline import VERSION, A, elide, human, num, visible_len
-except Exception:                                    # degrade, never disappear
-    VERSION = "unknown"       # the import is the version source; do not fake one
-    A = {k: "" for k in ("reset", "dim", "bold", "green",
-                         "yellow", "red", "cyan", "gray")}
+    from statusline import (BOLD, GREEN, RED, RESET, VERSION, clean, elide, gauge, human,
+                            muted, num, paint, state_colour, visible_len)
+except Exception:                                    # degrade to plain text, never disappear
+    VERSION = "unknown"
+    BOLD = RESET = ""
+    GREEN = RED = ""
 
     def num(x, default=0.0):
         try:
-            return float(x)
-        except (TypeError, ValueError):
+            v = float(x)
+        except (TypeError, ValueError, OverflowError):
             return default
+        return v if math.isfinite(v) else default
 
     def human(n):
         return f"{int(n) // 1000}k" if n >= 1000 else str(int(n))
@@ -73,24 +50,41 @@ except Exception:                                    # degrade, never disappear
     def elide(s, budget):
         return s if len(s) <= budget else s[:max(0, budget - 1)] + "…"
 
-# --- Tunables -------------------------------------------------------------
-BAR_W      = 6    # gauge width in cells (narrower than the main line's 12)
-WARN_PCT   = 60   # gauge turns yellow at this % of the context window
-HOT_PCT    = 85   # ...and red here
-NAME_MAX   = 22   # display cells for the task label
-FALLBACK_COLS = 80
-# ---------------------------------------------------------------------------
+    def clean(s):
+        return "".join(ch if ch.isprintable() else " " for ch in str(s))
 
-GLYPH = {"running": "▸", "pending": "·", "queued": "·",
-         "completed": "✓", "done": "✓", "failed": "✗", "error": "✗"}
+    def paint(s, colour, bold=False):
+        return s
+
+    def muted(s):
+        return s
+
+    def gauge(frac, width, colour):
+        return ""
+
+    def state_colour(pct, warn, hot):
+        return ""
+
+# --- Tunables ----------------------------------------------------------------
+BAR_W         = 8     # gauge cells
+WARN_PCT      = 60    # gauge turns amber at this % of the task's window
+HOT_PCT       = 85    # ...and red here
+NAME_MAX      = 22    # display cells for the label
+META_MAX      = 16    # display cells for model and effort
+MIN_DESC      = 20    # description cells kept before alignment is given up
+FALLBACK_COLS = 80
+# -------------------------------------------------------------------------------
+
+PCT_MAX = 999
+MAX_TOKENS = 999_000_000
+GAUGE_CELLS = BAR_W + 7          # gauge, space, "100%", space, "◬"
+STATUS = {"running": ("▸", None), "pending": ("·", None), "queued": ("·", None),
+          "completed": ("✓", GREEN), "done": ("✓", GREEN),
+          "failed": ("✗", RED), "error": ("✗", RED)}
 
 
 def short_model(model_id: str) -> str:
-    """claude-opus-5 → opus-5; claude-haiku-4-5-20251001 → haiku-4-5.
-
-    Trims the vendor prefix and any trailing date stamp, which carry no
-    information a human reading a crowded panel needs.
-    """
+    """claude-opus-5 -> opus-5; claude-haiku-4-5-20251001 -> haiku-4-5."""
     m = str(model_id).strip()
     if not m:
         return ""
@@ -104,49 +98,66 @@ def short_model(model_id: str) -> str:
     return "-".join(parts)
 
 
-def gauge(tokens: float, window: float) -> str:
-    """Coloured bar + percentage of the task's own context window."""
-    pct = tokens / window * 100 if window else 0
-    col = A["red"] if pct >= HOT_PCT else A["yellow"] if pct >= WARN_PCT else A["green"]
-    fill = max(0, min(BAR_W, round(pct / 100 * BAR_W)))
-    bar = "█" * fill + "░" * (BAR_W - fill)
-    return f"{col}{bar} {round(pct)}%{A['reset']}"
-
-
-def render_row(task: dict, columns: int) -> str:
-    """The row body for one task, trimmed to fit `columns` display cells."""
-    status = str(task.get("status") or "").lower()
-    glyph = GLYPH.get(status, "·")
-    label = str(task.get("label") or task.get("name") or "agent")
-    head = f"{glyph} {A['bold']}{A['cyan']}{elide(label, NAME_MAX)}{A['reset']}"
-
-    # Optional parts, in drop order (rightmost goes first).
-    parts = []
-
-    model = short_model(task.get("model") or "")
+def describe(task: dict) -> dict:
+    """The display values of one task, each bounded so no sibling can skew the columns."""
+    label = clean(task.get("label") or task.get("name") or "").strip() or "agent"
     effort = task.get("effort")
-    meta = model
-    if effort is not None and effort != "":
-        shown = human(num(effort)) if isinstance(effort, (int, float)) else str(effort)
-        meta = f"{meta} {shown}".strip()
-    if meta:
-        parts.append(f"{A['dim']}{meta}{A['reset']}")
+    if effort is None or isinstance(effort, bool):
+        shown = ""
+    elif isinstance(effort, (int, float)):
+        budget = num(effort, 0)
+        shown = human(min(budget, MAX_TOKENS)) if budget > 0 else ""
+    else:
+        shown = clean(effort).strip()
+    tokens = max(0.0, min(num(task.get("tokenCount"), 0), MAX_TOKENS))
+    return {
+        "status": str(task.get("status") or "").lower(),
+        "label": elide(label, NAME_MAX),
+        "meta": elide(f"{short_model(clean(task.get('model') or ''))} {shown}".strip(), META_MAX),
+        "window": max(0.0, num(task.get("contextWindowSize"), 0)),
+        "tokens": tokens,
+        "tokens_txt": human(tokens) if tokens > 0 else "",
+        "desc": clean(task.get("description") or "").strip(),
+    }
 
-    window = num(task.get("contextWindowSize"), 0)
-    tokens = num(task.get("tokenCount"), 0)
-    if window > 0:
-        parts.append(gauge(tokens, window))
-    if tokens > 0:
-        parts.append(f"{A['dim']}{human(tokens)}{A['reset']}")
 
-    desc = str(task.get("description") or "").strip()
+def context_part(row: dict) -> str:
+    pct = max(0, min(PCT_MAX, round(row["tokens"] / row["window"] * 100)))
+    colour = state_colour(pct, WARN_PCT, HOT_PCT)
+    mark = " " + paint("◬", RED) if pct >= 100 else "  "
+    return f"{gauge(pct / 100, BAR_W, colour)} {paint(f'{pct:>3}%', colour)}{mark}"
 
-    sep = "  "
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - visible_len(s))
+
+
+def render_row(row: dict, columns: int, widths=None) -> str:
+    """One row trimmed to `columns` cells; `widths` aligns it with its siblings."""
+    glyph, colour = STATUS.get(row["status"], ("·", None))
+    head = f"{glyph if colour is None else paint(glyph, colour)} {BOLD}{row['label']}{RESET}"
+    parts = []
+    if widths:
+        head = pad(head, widths["label"] + 2)
+        if widths["meta"]:
+            parts.append(muted(pad(row["meta"], widths["meta"])))
+        if widths["gauge"]:
+            parts.append(context_part(row) if row["window"] > 0 else " " * GAUGE_CELLS)
+        if widths["tokens"]:
+            parts.append(muted(row["tokens_txt"].rjust(widths["tokens"])))
+    else:
+        if row["meta"]:
+            parts.append(muted(row["meta"]))
+        if row["window"] > 0:
+            parts.append(context_part(row).rstrip())
+        if row["tokens_txt"]:
+            parts.append(muted(row["tokens_txt"]))
+
     while True:
-        line = sep.join([head] + parts)
-        room = columns - visible_len(line) - len(sep)
-        if desc and room > 4:
-            line += sep + f"{A['dim']}{elide(desc, room)}{A['reset']}"
+        line = "  ".join([head] + parts)
+        room = columns - visible_len(line) - 2
+        if row["desc"] and room > 4:
+            line += "  " + muted(elide(row["desc"], room))
         if visible_len(line) <= columns or not parts:
             return line
         parts.pop()
@@ -160,20 +171,36 @@ def render_rows(d: dict) -> list:
         columns = int(num(d.get("columns"), FALLBACK_COLS)) or FALLBACK_COLS
     except Exception:
         columns = FALLBACK_COLS
+    tasks = d.get("tasks") if isinstance(d.get("tasks"), list) else []
+
+    described = []
+    for task in tasks:
+        if not isinstance(task, dict) or not task.get("id"):
+            continue                       # no id: the harness keeps its default row
+        try:
+            described.append((str(task["id"]), describe(task)))
+        except Exception:
+            continue                       # one bad task drops its row only
+
+    rows_only = [r for _, r in described]
+    widths = {
+        "label": max((visible_len(r["label"]) for r in rows_only), default=0),
+        "meta": max((visible_len(r["meta"]) for r in rows_only), default=0),
+        "gauge": any(r["window"] > 0 for r in rows_only),
+        "tokens": max((len(r["tokens_txt"]) for r in rows_only), default=0),
+    }
+    needed = (2 + widths["label"] + MIN_DESC
+              + (widths["meta"] + 2 if widths["meta"] else 0)
+              + (GAUGE_CELLS + 2 if widths["gauge"] else 0)
+              + (widths["tokens"] + 2 if widths["tokens"] else 0) + 2)
 
     rows = []
-    for task in (d.get("tasks") or []):
-        if not isinstance(task, dict):
-            continue
-        tid = task.get("id")
-        if not tid:                       # no id → keep the default rendering
-            continue
+    for tid, row in described:
         try:
-            content = render_row(task, columns)
+            content = render_row(row, columns, widths if columns >= needed else None)
         except Exception:
-            continue                      # one bad task drops its row only
-        rows.append(json.dumps({"id": str(tid), "content": content},
-                               ensure_ascii=False))
+            continue
+        rows.append(json.dumps({"id": tid, "content": content}, ensure_ascii=False))
     return rows
 
 

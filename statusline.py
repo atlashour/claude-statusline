@@ -1,81 +1,31 @@
 #!/usr/bin/env python3
-"""Claude Code status line v5 — adaptive context-saturation gauge.
+"""Claude Code status line: model, location, context gauge, rate limits, session totals.
 
-Design rationale (v5 over v4):
+The context gauge measures usage against a comfort budget, not the context window:
+COMFORT_ABS tokens, clamped to COMFORT_FRAC of the real window so it never promises
+headroom the window does not have. Quality degrades in absolute terms, whatever the
+window size.
 
-A. VERSIONED. `--version` prints the build a machine carries, so a
-   fleet can be audited over ssh. It is deliberately NOT painted on the
-   line: a version sitting next to the model name reads as the model's
-   version. Bump VERSION when this file changes.
+Rendering rules:
+- Colour is state, never decoration: the theme's green, yellow and red by each metric's
+  own thresholds, compared against the rounded percentage that is displayed. Red means
+  alarm. Secondary text uses explicit greys: Claude Code already dims the whole line, so
+  SGR dim would carry no hierarchy.
+- Gauge widths depend on COLUMNS alone (GAUGE_TIERS), so they never change between
+  refreshes of the same terminal. Only the 5h limit gets a gauge.
+- When the line does not fit, segments drop by priority: lines changed, duration, cost,
+  window percentage, session and directory, rate limits. Model and gauge never drop.
+- Glyphs that common terminal fonts lack (◬ ◷ ⟳) are followed by a space: their fallback
+  glyph can be wider than one cell and would otherwise overlap the next character.
+- State colours are never bold: many terminals draw bold colours in their bright variant,
+  which would split one state into two tones.
 
-B. SESSION IDENTITY. Renders `session_name`, the handle other sessions
-   address this one by via SendMessage. Note the harness only fills
-   that field for a session named with --name or /rename, or one with
-   an AI-generated title: the default display name (my-app-3f) does NOT
-   populate it, so name your sessions if you want this segment. Elided
-   to SESSION_MAX cells because generated titles are whole sentences.
+Failure containment: every optional segment is built behind its own guard, object fields
+are read defensively, numbers are coerced to finite floats, and a failure in the core
+path prints "ctx: n/a". Stdin and stdout are forced to UTF-8. `git status` runs at most
+once per GIT_TTL seconds per session.
 
-C. HARDER FAILURE CONTAINMENT. Object-typed fields are read through
-   obj(), so a field arriving as a bare string or list degrades to an
-   empty segment instead of raising past the optional-segment guards
-   (v4 raised on, e.g., a string "model" and fell back to "ctx: n/a").
-
-A companion script, subagent_statusline.py, renders the agent panel's
-rows in the same visual language and imports its helpers from here.
-The dependency points that way on purpose: this file stays
-self-contained, because it is the one that must never fail.
-
-Design rationale (v4 over v3):
-
-1. CORRECTNESS — the comfort ceiling is *window-aware*, not model-biased.
-   v3 used a fixed COMFORT=250k, which exceeds a 200k context window: on
-   200k-window sessions the gauge could never reach red before the hard
-   limit forced a compaction. v4 clamps the effective budget to
-   min(COMFORT_ABS, 80% of the reported window). On a 1M window the
-   absolute 250k ceiling governs (context rot is absolute, not
-   proportional); on a 200k window the clamp fires red at 160k. The same
-   file is therefore correct on any machine regardless of which model or
-   window size it runs.
-
-2. PERFORMANCE — `git status` is cached per session (GIT_TTL seconds,
-   keyed by a sanitized session_id per the official docs' recommendation)
-   instead of running on every render. The cache invalidates when cwd
-   changes; dirty/ahead/behind may lag up to GIT_TTL seconds by design.
-   Cache files live in the OS temp dir and are cleaned by the OS.
-
-3. NEW VITAL DATA — subscription rate limits (5 h / 7 d windows) with
-   threshold colours and the local reset time once the 5 h window passes
-   LIMIT_HOT %; session duration; lines added/removed.
-
-4. WIDTH-ADAPTIVE — reads the COLUMNS env var (injected by Claude Code
-   v2.1.153+; without it FALLBACK_COLS assumes a wide terminal, because
-   the docs state the real size is unreadable from inside the script) and
-   drops the least-important segments first so the line never wraps:
-   lines± → duration → cost → git/dir → limits. Model and the context
-   gauge never drop; as a last resort the gauge sheds its dim
-   window-fill suffix. Width counting is ANSI-aware and counts
-   East-Asian Wide/Fullwidth characters (e.g. CJK directory names) as 2
-   cells; ambiguous-width glyphs count as 1, matching the default of
-   Terminal.app/iTerm2 (a terminal configured ambiguous-as-wide will
-   render slightly wider than computed).
-
-Input: the statusLine JSON on stdin (model.display_name, effort.level,
-context_window.*, cost.*, workspace.current_dir, rate_limits.*,
-session_id). context_window.total_input_tokens reflects the live window
-on Claude Code >= 2.1.132 (older versions reported cumulative session
-totals there; the current_usage fallback covers them). External calls:
-at most two short git commands per cache refresh (`status`, plus
-`rev-parse` only when HEAD is detached), both with a 1 s timeout.
-
-Failure containment is layered: each optional segment (git/dir, limits,
-cost, duration, lines±) is built inside its own guard and silently
-disappears if its data is malformed — one bad field cannot erase the
-gauge; a failure in the core path degrades to "ctx: n/a"; stdin and
-stdout are forced to UTF-8 regardless of `-X utf8` (Windows defaults to
-cp1252, which would garble non-ASCII names on the way in and raise on the
-bar/separator glyphs on the way out).
-
-No third-party dependencies; Python 3.7+ (tested on 3.9).
+Input: the statusLine JSON on stdin. Output: one line. Python 3.7+, standard library only.
 """
 import json
 import math
@@ -84,48 +34,51 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime
-from unicodedata import east_asian_width
 
-# --- Tunables (edit these) ------------------------------------------------
-VERSION       = "5.0.1"  # reported by --version; never drawn on the line
-SESSION_MAX   = 20       # display cells allowed to session_name before eliding
-COMFORT_ABS   = 250_000  # absolute mental-saturation ceiling (tokens)
-COMFORT_FRAC  = 0.80     # ...but never above this fraction of the real window
-WARN_FRAC     = 0.60     # caution band starts at this fraction of the budget
-BAR_W         = 12       # gauge width in cells
+# --- Tunables ----------------------------------------------------------------
+VERSION       = "6.0.0"  # reported by --version; never drawn on the line
+SESSION_MAX   = 20       # display cells allowed to the session name
+MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
+COMFORT_ABS   = 250_000  # absolute comfort budget (tokens)
+COMFORT_FRAC  = 0.80     # ...never above this fraction of the real window
+WARN_FRAC     = 0.60     # context turns amber at this fraction of the budget
+LIMIT_WARN    = 60       # rate limit %: amber from here
+LIMIT_HOT     = 85       # rate limit %: red, and the reset time appears
 GIT_TTL       = 5.0      # seconds to reuse a cached `git status`
-LIMIT_WARN    = 60       # rate-limit %: yellow from here
-LIMIT_HOT     = 85       # rate-limit %: red + show reset time from here
-FALLBACK_COLS = 200      # assumed width when COLUMNS is absent (favours info)
-# ---------------------------------------------------------------------------
+FALLBACK_COLS = 200      # assumed width when COLUMNS is absent
+# (minimum columns, context gauge cells, 5h limit gauge cells; 0 shows the 5h limit as text).
+# Tuned for a typical session (short name, cost under $100, a few hundred lines changed): it
+# keeps every segment. Heavier lines shed lines changed first, then duration, as usual.
+GAUGE_TIERS   = ((181, 28, 10), (175, 24, 8), (169, 20, 6), (161, 20, 0), (157, 16, 0), (0, 12, 0))
+# SGR parameters. States use the terminal theme's own palette; greys are fixed xterm-256.
+GREEN, AMBER, RED = "32", "33", "31"
+SEP, MUTED = "38;5;240", "38;5;245"
+# -------------------------------------------------------------------------------
 
-A = {
-    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
-    "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
-    "cyan": "\033[36m", "gray": "\033[90m",
-}
+RESET, BOLD = "\033[0m", "\033[1m"
+PCT_MAX = 999
+MAX_TOKENS = 999_000_000
+TAIL = ("cost", "duration", "lines")
 
 # Keep the git subprocess from flashing a console window on Windows.
 _NOWINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
 def num(x, default=0.0):
-    """Coerce a JSON value to a finite float; anything else falls back, never raises.
-
-    Infinity and NaN are rejected too: Python's json accepts both literals
-    and int() raises on either, which would take the core path down.
-    """
+    """Coerce a JSON value to a finite float; anything else returns `default`, never raises."""
     try:
         v = float(x)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):     # OverflowError: float(10**400)
         return default
     return v if math.isfinite(v) else default
 
 
-def human(n: int) -> str:
-    # 1_000_000 → "1M", 1_250_000 → "1.25M", 250_000 → "250k" (no ragged ".00M").
-    if n >= 1_000_000:
+def human(n) -> str:
+    """250_000 -> "250k", 999_500 -> "1M", 1_250_000 -> "1.25M"."""
+    n = max(0, n)
+    if n >= 999_500:
         return f"{n / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
     if n >= 1_000:
         return f"{n / 1_000:.0f}k"
@@ -133,41 +86,37 @@ def human(n: int) -> str:
 
 
 def visible_len(s: str) -> int:
-    """Terminal display width of s.
-
-    CSI escape sequences (ESC [ ... final-byte) are zero-width; East-Asian
-    Wide/Fullwidth characters count 2 cells; everything else counts 1.
-    """
+    """Terminal display width: CSI sequences are zero-width, East Asian Wide/Fullwidth count 2."""
     out, i, n = 0, 0, len(s)
     while i < n:
-        ch = s[i]
-        if ch == "\033" and i + 1 < n and s[i + 1] == "[":
+        if s[i] == "\033" and i + 1 < n and s[i + 1] == "[":
             j = i + 2
-            while j < n and not ("@" <= s[j] <= "~"):    # CSI ends at any final byte
+            while j < n and not ("@" <= s[j] <= "~"):
                 j += 1
             i = j + 1
         else:
-            out += 2 if east_asian_width(ch) in ("W", "F") else 1
+            out += 2 if unicodedata.east_asian_width(s[i]) in ("W", "F") else 1
             i += 1
     return out
 
 
 def elide(s: str, budget: int) -> str:
-    """Trim s to at most `budget` display cells, marking the cut with an ellipsis.
-
-    Measured in cells rather than characters so a CJK session name is
-    trimmed to the width it actually occupies, matching visible_len().
-    """
+    """Trim s to at most `budget` display cells, marking the cut with an ellipsis."""
     if budget <= 0:
         return ""
     if visible_len(s) <= budget:
         return s
     out = ""
     for ch in s:
-        if visible_len(out + ch) > budget - 1:       # reserve a cell for "…"
+        if visible_len(out + ch) > budget - 1:
             break
         out += ch
     return out + "…"
+
+
+def clean(s) -> str:
+    """Replace control, format and line/paragraph separator characters with spaces."""
+    return "".join(" " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch for ch in str(s))
 
 
 def short_dir(path: str) -> str:
@@ -182,6 +131,50 @@ def short_dir(path: str) -> str:
         return "~/" + p[len(home) + 1:]
     return p
 
+
+def obj(d, key: str) -> dict:
+    """d[key] when it is a mapping, else {}: a malformed field degrades to an empty segment."""
+    v = d.get(key) if isinstance(d, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def fmt_duration(ms: float) -> str:
+    s = int(ms // 1000)
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+# --- Styling -------------------------------------------------------------------
+
+def paint(s: str, sgr: str, bold: bool = False) -> str:
+    return f"\033[{'1;' if bold else ''}{sgr}m{s}{RESET}" if s else ""
+
+
+def muted(s: str) -> str:
+    return paint(s, MUTED)
+
+
+def state_colour(pct: int, warn: int, hot: int) -> str:
+    return RED if pct >= hot else AMBER if pct >= warn else GREEN
+
+
+def gauge(frac: float, width: int, colour: str) -> str:
+    """`width` cells of █ (used) and ░ (free) in the state colour."""
+    fill = round(max(0.0, min(1.0, frac)) * width)
+    return paint("█" * fill + "░" * (width - fill), colour)
+
+
+def gauge_widths(cols: int):
+    """(context gauge cells, 5h limit gauge cells) for a terminal `cols` wide."""
+    return next(((ctx, limit) for min_cols, ctx, limit in GAUGE_TIERS if cols >= min_cols), (12, 0))
+
+
+# --- Git -----------------------------------------------------------------------
 
 def _git(cwd: str, *args: str):
     try:
@@ -202,21 +195,19 @@ def _git_status_live(cwd: str):
 
     lines = r.stdout.splitlines()
     head = lines[0] if lines else ""
-    dirty = len(lines) > 1            # any porcelain entry (incl. untracked)
+    dirty = len(lines) > 1
     branch, ahead, behind = "", 0, 0
 
     if head.startswith("## "):
         info = head[3:]
-        # Unborn branch (no commits yet); older gits said "Initial commit on".
-        for prefix in ("No commits yet on ", "Initial commit on "):
+        for prefix in ("No commits yet on ", "Initial commit on "):     # unborn branch
             if info.startswith(prefix):
                 branch = info[len(prefix):].strip().split(" ")[0]
                 break
-        # Detached HEAD is exactly "HEAD (no branch)" — a branch literally
-        # named e.g. "HEADx" is legal and must NOT be treated as detached.
+        # Detached HEAD is exactly "HEAD (no branch)"; a branch named "HEADx" is legal.
         if not branch and info != "HEAD" and not info.startswith("HEAD ("):
             branch = info.split(" ")[0].split("...")[0]
-        if "[" in head and "]" in head:                  # [ahead N, behind M]
+        if "[" in head and "]" in head:                                  # [ahead N, behind M]
             for part in head[head.index("[") + 1:head.index("]")].split(","):
                 part = part.strip()
                 if part.startswith("ahead "):
@@ -224,7 +215,7 @@ def _git_status_live(cwd: str):
                 elif part.startswith("behind "):
                     behind = int(num(part[7:], 0))
 
-    if not branch:                                       # detached HEAD → sha
+    if not branch:                                                       # detached HEAD
         r2 = _git(cwd, "rev-parse", "--short", "HEAD")
         if r2 is not None and r2.returncode == 0:
             branch = r2.stdout.strip()
@@ -233,13 +224,10 @@ def _git_status_live(cwd: str):
 
 
 def git_info(cwd: str, session_id: str):
-    """Cached git state: at most one live `git status` every GIT_TTL seconds.
+    """Git state cached per session for GIT_TTL seconds, invalidated when cwd changes.
 
-    Keyed by session_id (stable within a session, unique across sessions,
-    per the docs), sanitized before use in a filename. Invalidated when
-    cwd changes mid-session. The temp file is written atomically under a
-    pid-unique name so overlapping renders cannot interleave writes; a
-    corrupted cache reads as a miss and self-heals on the next refresh.
+    The cache file is written atomically under a pid-unique name; a corrupt cache reads
+    as a miss and heals on the next refresh.
     """
     if not cwd or not os.path.isdir(cwd):
         return None
@@ -257,163 +245,134 @@ def git_info(cwd: str, session_id: str):
         pass
 
     info = _git_status_live(cwd)
+    tmp = f"{cache}.{os.getpid()}.tmp"
     try:
-        tmp = f"{cache}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"cwd": cwd, "info": info}, f)
         os.replace(tmp, cache)
     except Exception:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return info
 
 
-def limit_col(pct: float) -> str:
-    if pct >= LIMIT_HOT:
-        return A["red"]
-    if pct >= LIMIT_WARN:
-        return A["yellow"]
-    return A["green"]
+# --- Line ------------------------------------------------------------------------
 
-
-def fmt_duration(ms: float) -> str:
-    s = int(ms // 1000)
-    h, rem = divmod(s, 3600)
-    m = rem // 60
-    if h:
-        return f"{h}h {m:02d}m"
-    if m:
-        return f"{m}m"
-    return f"{s}s"
-
-
-def obj(d: dict, key: str) -> dict:
-    """d[key] when it is a mapping, else {}.
-
-    The harness documents these fields as objects, but a future rename or a
-    truncated payload can deliver a bare string or a list; treating those as
-    empty keeps one malformed field from erasing the whole line.
-    """
-    v = d.get(key) if isinstance(d, dict) else None
-    return v if isinstance(v, dict) else {}
+def _join(segments) -> str:
+    separator = f" {paint('│', SEP)} "
+    out, prev = "", None
+    for _, key, text in segments:
+        if prev is not None:
+            if key == "window":
+                pass                           # the window percentage trails the gauge
+            elif key in TAIL and prev in TAIL:
+                out += "  "                    # cost, duration and lines read as one group
+            else:
+                out += separator
+        out += text
+        prev = key
+    return out
 
 
 def render(d: dict) -> str:
     if not isinstance(d, dict):
         d = {}
-    model = obj(d, "model").get("display_name") or "Claude"
-    effort = obj(d, "effort").get("level")
+    try:
+        cols = max(0, int(os.environ.get("COLUMNS") or FALLBACK_COLS))
+    except Exception:
+        cols = FALLBACK_COLS
+    ctx_w, limit_w = gauge_widths(cols)
+
     cw = obj(d, "context_window")
-    cost_o = obj(d, "cost")
+    cost = obj(d, "cost")
     cwd = obj(d, "workspace").get("current_dir") or d.get("cwd") or ""
-    session_id = d.get("session_id") or ""
-    session_name = d.get("session_name") or ""
 
-    used = int(num(cw.get("total_input_tokens"), 0))
-    if not used:
+    used = num(cw.get("total_input_tokens"), 0)
+    if used <= 0:     # Claude Code < 2.1.132 reported cumulative totals; current_usage covers it
         cu = obj(cw, "current_usage")
-        used = int(
-            num(cu.get("input_tokens"), 0)
-            + num(cu.get("cache_creation_input_tokens"), 0)
-            + num(cu.get("cache_read_input_tokens"), 0)
-        )
-
-    window = int(num(cw.get("context_window_size"), 0))
+        used = sum(num(cu.get(k), 0) for k in
+                   ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    used = int(max(0.0, min(used, MAX_TOKENS)))
+    window = int(max(0.0, min(num(cw.get("context_window_size"), 0), MAX_TOKENS)))
     wp = num(cw.get("used_percentage"), None)
-    if wp is None:
-        win_pct = round(used / window * 100) if window else 0
-    else:
-        win_pct = round(wp)
+    win_pct = round(wp) if wp is not None else (round(used / window * 100) if window else 0)
+    win_pct = max(0, min(PCT_MAX, win_pct))
 
-    # Window-aware comfort budget: the absolute ceiling, clamped so red always
-    # fires before the hard window limit (v3 bug: 250k > a 200k window).
-    comfort = min(COMFORT_ABS, int(window * COMFORT_FRAC)) if window else COMFORT_ABS
-    warn = int(comfort * WARN_FRAC)
+    comfort = max(1, min(COMFORT_ABS, int(window * COMFORT_FRAC)) if window else COMFORT_ABS)
+    pct = min(PCT_MAX, round(used / comfort * 100))
+    colour = state_colour(pct, round(WARN_FRAC * 100), 100)
+    saturated = pct >= 100
 
-    if used >= comfort:
-        col = A["red"]
-    elif used >= warn:
-        col = A["yellow"]
-    else:
-        col = A["green"]
+    # --- core segments: never dropped ------------------------------------------
+    model = elide(clean(obj(d, "model").get("display_name") or "Claude"), MODEL_MAX)
+    effort = obj(d, "effort").get("level")
+    model_seg = f"{BOLD}{model}{RESET}" + (f" {muted(clean(effort))}" if effort else "")
 
-    frac = used / comfort if comfort else 0.0
-    fill = min(BAR_W, round(frac * BAR_W))
-    bar = "█" * fill + "░" * (BAR_W - fill)
-    sat_pct = round(frac * 100)
-    flag = "  ◬ saturated" if used >= comfort else ""
+    used_txt = paint(human(used), RED) if saturated else human(used)
+    ctx_seg = (f"{muted('ctx')} {used_txt}{muted('/' + human(comfort))} "
+               f"{gauge(pct / 100, ctx_w, colour)} {paint(f'{pct}%', colour)}")
+    if saturated:
+        ctx_seg += " " + paint("◬ saturated", RED)
 
-    # --- core segments (never dropped; guarded only by main's catch-all) --
-    model_seg = f"{A['bold']}{A['cyan']}{model}{A['reset']}"
-    if effort:
-        model_seg += f" {A['dim']}{effort}{A['reset']}"
+    # --- optional segments: bad data drops the segment, never the line ----------
+    def build_window() -> str:
+        return muted(f" · {win_pct}% of {human(window)}") if window else ""
 
-    ctx_min = f"{col}ctx {human(used)}/{human(comfort)} {bar} {sat_pct}%{flag}{A['reset']}"
-    ctx_seg = ctx_min
-    if window:
-        ctx_seg += f"{A['dim']} · {win_pct}% of {human(window)}{A['reset']}"
-
-    # --- optional segments: each guarded so bad data drops the segment, ---
-    # --- never the line -----------------------------------------------------
     def build_session() -> str:
-        """The session's own name — the handle other sessions address it by.
+        name = clean(d.get("session_name") or "").strip()
+        return muted(elide(name, SESSION_MAX)) if name else ""
 
-        Absent unless the session was named with --name or /rename, or has an
-        AI-generated title: the default display name (e.g. my-app-3f) does not
-        populate this field. Elided because generated titles are sentences.
-        """
-        name = str(session_name).strip()
-        return f"{A['dim']}{elide(name, SESSION_MAX)}{A['reset']}" if name else ""
-
-    def build_loc() -> str:
-        dir_disp = short_dir(cwd)
-        if not dir_disp:
+    def build_location() -> str:
+        seg = short_dir(clean(cwd))
+        if not seg:
             return ""
-        seg = dir_disp
-        git = git_info(cwd, session_id)
+        git = git_info(cwd, d.get("session_id") or "")
         if git:
-            inner = f"{A['dim']}{git['branch']}{A['reset']}"
-            if git["dirty"]:
-                inner += f"{A['yellow']}*{A['reset']}"
-            div = ""
-            if git["ahead"]:
-                div += f"{A['dim']}↑{git['ahead']}{A['reset']}"
-            if git["behind"]:
-                div += f"{A['dim']}↓{git['behind']}{A['reset']}"
-            if div:
-                inner += " " + div
-            seg += f" {A['dim']}({A['reset']}{inner}{A['dim']}){A['reset']}"
+            inner = muted(clean(git["branch"])) + (f"{BOLD}*{RESET}" if git["dirty"] else "")
+            marks = (f"↑{git['ahead']}" if git["ahead"] else "") + \
+                    (f"↓{git['behind']}" if git["behind"] else "")
+            if marks:
+                inner += " " + muted(marks)
+            seg += f" {muted('(')}{inner}{muted(')')}"
         return seg
 
     def build_limits() -> str:
         rl = obj(d, "rate_limits")
         parts = []
         for tag, key in (("5h", "five_hour"), ("7d", "seven_day")):
-            w = obj(rl, key)                  # one malformed window drops only itself
-            pct = num(w.get("used_percentage"), None)
-            if pct is None:
+            w = obj(rl, key)                     # one malformed window drops only itself
+            raw = num(w.get("used_percentage"), None)
+            if raw is None:
                 continue
-            seg = f"{limit_col(pct)}{tag} {pct:.0f}%{A['reset']}"
-            if tag == "5h" and pct >= LIMIT_HOT:
-                resets = int(num(w.get("resets_at"), 0))
-                if resets > 0:
-                    t = datetime.fromtimestamp(resets).strftime("%H:%M")
-                    seg += f"{A['dim']} ⟳{t}{A['reset']}"
+            p = max(0, min(PCT_MAX, round(raw)))
+            c = state_colour(p, LIMIT_WARN, LIMIT_HOT)
+            seg = muted(tag) + " "
+            if limit_w and tag == "5h":      # 7d barely moves within a session: text is enough
+                seg += gauge(p / 100, limit_w, c) + " "
+            seg += paint(f"{p}%", c)
+            if tag == "5h" and p >= LIMIT_HOT:
+                try:
+                    resets = int(num(w.get("resets_at"), 0))
+                    if resets > 0:
+                        seg += " " + paint("⟳ " + datetime.fromtimestamp(resets).strftime("%H:%M"), c)
+                except (OverflowError, OSError, ValueError):
+                    pass
             parts.append(seg)
-        return " ".join(parts)
+        return ("  " if limit_w else " ").join(parts)
 
     def build_cost() -> str:
-        return f"{A['dim']}${num(cost_o.get('total_cost_usd'), 0.0):.2f}{A['reset']}"
+        return muted(f"${max(0.0, num(cost.get('total_cost_usd'), 0.0)):.2f}")
 
-    def build_dur() -> str:
-        ms = num(cost_o.get("total_duration_ms"), 0)
-        return f"{A['dim']}◷ {fmt_duration(ms)}{A['reset']}" if ms else ""
+    def build_duration() -> str:
+        ms = num(cost.get("total_duration_ms"), 0)
+        return muted("◷ " + fmt_duration(ms)) if ms > 0 else ""
 
     def build_lines() -> str:
-        la = int(num(cost_o.get("total_lines_added"), 0))
-        lr = int(num(cost_o.get("total_lines_removed"), 0))
-        if not (la or lr):
-            return ""
-        return f"{A['green']}+{la}{A['reset']} {A['red']}−{lr}{A['reset']}"
+        added = int(max(0.0, num(cost.get("total_lines_added"), 0)))
+        removed = int(max(0.0, num(cost.get("total_lines_removed"), 0)))
+        return muted(f"+{added} −{removed}") if (added or removed) else ""
 
     def safe(build) -> str:
         try:
@@ -421,42 +380,29 @@ def render(d: dict) -> str:
         except Exception:
             return ""
 
-    # priority: 0 model+ctx (never dropped) · 1 limits · 2 session/git/dir
-    #           · 3 cost · 4 duration · 5 lines±  — higher number is dropped first
-    ordered = [                          # (priority, key, segment) in display order
+    # (drop priority, key, text) in display order; the highest priority drops first
+    segments = [
         (0, "model", model_seg),
-        (2, "sess", safe(build_session)),
-        (2, "loc", safe(build_loc)),
-        (0, "ctx", ctx_seg),
+        (2, "session", safe(build_session)),
+        (2, "location", safe(build_location)),
+        (0, "context", ctx_seg),
+        (3, "window", safe(build_window)),
         (1, "limits", safe(build_limits)),
-        (3, "cost", safe(build_cost)),
-        (4, "dur", safe(build_dur)),
-        (5, "lines", safe(build_lines)),
+        (4, "cost", safe(build_cost)),
+        (5, "duration", safe(build_duration)),
+        (6, "lines", safe(build_lines)),
     ]
-    ordered = [(p, k, s) for p, k, s in ordered if s]
+    segments = [s for s in segments if s[2]]
 
-    # --- width-adaptive assembly: drop least-important segments until it fits
-    try:
-        cols = int(os.environ.get("COLUMNS") or FALLBACK_COLS)
-    except Exception:
-        cols = FALLBACK_COLS
-
-    sep = f" {A['gray']}│{A['reset']} "
     while True:
-        line = sep.join(s for _, _, s in ordered)
-        if visible_len(line) <= cols:
-            return line
-        if all(p == 0 for p, _, _ in ordered):
-            break
-        worst = max(p for p, _, _ in ordered)
-        for i in range(len(ordered) - 1, -1, -1):        # rightmost of the worst
-            if ordered[i][0] == worst:
-                del ordered[i]
+        line = _join(segments)
+        if visible_len(line) <= cols or all(p == 0 for p, _, _ in segments):
+            return line                    # model + gauge alone may exceed; the harness truncates
+        worst = max(p for p, _, _ in segments)
+        for i in range(len(segments) - 1, -1, -1):          # rightmost of the lowest importance
+            if segments[i][0] == worst:
+                del segments[i]
                 break
-
-    # Last resort: shed the gauge's dim window-fill suffix. If even this
-    # exceeds cols, return it anyway — the harness truncates the tail.
-    return sep.join(ctx_min if k == "ctx" else s for _, k, s in ordered)
 
 
 def main() -> None:
