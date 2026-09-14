@@ -38,7 +38,7 @@ import unicodedata
 from datetime import datetime
 
 # --- Tunables ----------------------------------------------------------------
-VERSION       = "6.0.0"  # reported by --version; never drawn on the line
+VERSION       = "5.1.0"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to the session name
 MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
 COMFORT_ABS   = 250_000  # absolute comfort budget (tokens)
