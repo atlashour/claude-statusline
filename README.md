@@ -46,8 +46,8 @@ setting is re-read while a session is open.
 | Segment | Example | Notes |
 |---|---|---|
 | Model and effort | `Opus 5 medium` | |
-| Session name | `gateway` | Shown once the session is named with `--name` or `/rename`, or gets a generated title |
 | Directory and git | `~/projects/webapp (main* ↑2)` | `*` for uncommitted or untracked changes, `↑` `↓` for commits ahead and behind |
+| Session name | `gateway` | Shown once the session is named with `--name` or `/rename`, or gets a generated title |
 | Context | `ctx 215k/250k`, gauge, `86% · 22% of 1M` | `◬ saturated` once usage passes the budget |
 | Rate limits | `5h`, gauge, `91% ⟳ 02:26  7d 41%` | The 5-hour reset time appears from 85% |
 | Session | `$9.40  ◷ 2h 30m  +310 −88` | Cost, elapsed time, lines added and removed |
@@ -55,13 +55,15 @@ setting is re-read while a session is open.
 Colours come from your terminal theme. Context turns yellow at 60% of the budget and red
 at 100%; rate limits turn yellow at 60% and red at 85%.
 
-The context gauge widens with the terminal, from 12 cells up to 28 at 181 columns. The
-5-hour limit gets its own gauge from 169 columns. Widths depend only on the terminal
-size, so a gauge never changes length between refreshes.
+The context gauge widens with the terminal, from 12 cells up to 28 at 187 columns. The
+5-hour limit gets its own gauge from 175 columns. Widths depend only on the terminal
+size, so a gauge never changes length between refreshes. The line stops 4 columns short
+of the terminal width, which Claude Code keeps for its own margins.
 
-The line never wraps. When it runs out of room, segments drop in this order: lines
-changed, elapsed time, cost, window percentage, session name and directory, rate limits.
-Model and context gauge always stay.
+The line never wraps. When it runs out of room, segments drop in this order: session
+name, lines changed, elapsed time, cost, window percentage, directory, rate limits. Model
+and context gauge always stay. The session name goes first because Claude Code already
+shows a name set with `--name` or `/rename` on its prompt bar.
 
 ## Subagent rows
 

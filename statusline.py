@@ -13,8 +13,12 @@ Rendering rules:
   SGR dim would carry no hierarchy.
 - Gauge widths depend on COLUMNS alone (GAUGE_TIERS), so they never change between
   refreshes of the same terminal. Only the 5h limit gets a gauge.
-- When the line does not fit, segments drop by priority: lines changed, duration, cost,
-  window percentage, session and directory, rate limits. Model and gauge never drop.
+- The line is fitted to COLUMNS minus RESERVE: Claude Code draws the status line inside its
+  own margins and truncates anything wider with an ellipsis.
+- When the line does not fit, segments drop by priority: session name, lines changed,
+  duration, cost, window percentage, directory, rate limits. Model and gauge never drop.
+  The session name goes first because Claude Code already shows a name set with --name
+  or /rename on the prompt bar.
 - Glyphs that common terminal fonts lack (◬ ◷ ⟳) are followed by a space: their fallback
   glyph can be wider than one cell and would otherwise overlap the next character.
 - State colours are never bold: many terminals draw bold colours in their bright variant,
@@ -38,7 +42,7 @@ import unicodedata
 from datetime import datetime
 
 # --- Tunables ----------------------------------------------------------------
-VERSION       = "5.1.0"  # reported by --version; never drawn on the line
+VERSION       = "5.1.1"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to the session name
 MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
 COMFORT_ABS   = 250_000  # absolute comfort budget (tokens)
@@ -48,10 +52,11 @@ LIMIT_WARN    = 60       # rate limit %: amber from here
 LIMIT_HOT     = 85       # rate limit %: red, and the reset time appears
 GIT_TTL       = 5.0      # seconds to reuse a cached `git status`
 FALLBACK_COLS = 200      # assumed width when COLUMNS is absent
+RESERVE       = 4        # columns Claude Code keeps for its margins (measured on 2.1.270)
 # (minimum columns, context gauge cells, 5h limit gauge cells; 0 shows the 5h limit as text).
-# Tuned for a typical session (short name, cost under $100, a few hundred lines changed): it
-# keeps every segment. Heavier lines shed lines changed first, then duration, as usual.
-GAUGE_TIERS   = ((181, 28, 10), (175, 24, 8), (169, 20, 6), (161, 20, 0), (157, 16, 0), (0, 12, 0))
+# Measured so wider gauges never cost a segment other than the session name, even for a
+# heavy session: a 20-cell name, $87, 5h 30m, +3000 -900 lines and the reset time shown.
+GAUGE_TIERS   = ((187, 28, 10), (181, 24, 8), (175, 20, 6), (167, 20, 0), (163, 16, 0), (0, 12, 0))
 # SGR parameters. States use the terminal theme's own palette; greys are fixed xterm-256.
 GREEN, AMBER, RED = "32", "33", "31"
 SEP, MUTED = "38;5;240", "38;5;245"
@@ -383,8 +388,8 @@ def render(d: dict) -> str:
     # (drop priority, key, text) in display order; the highest priority drops first
     segments = [
         (0, "model", model_seg),
-        (2, "session", safe(build_session)),
         (2, "location", safe(build_location)),
+        (7, "session", safe(build_session)),
         (0, "context", ctx_seg),
         (3, "window", safe(build_window)),
         (1, "limits", safe(build_limits)),
@@ -396,7 +401,7 @@ def render(d: dict) -> str:
 
     while True:
         line = _join(segments)
-        if visible_len(line) <= cols or all(p == 0 for p, _, _ in segments):
+        if visible_len(line) <= cols - RESERVE or all(p == 0 for p, _, _ in segments):
             return line                    # model + gauge alone may exceed; the harness truncates
         worst = max(p for p, _, _ in segments)
         for i in range(len(segments) - 1, -1, -1):          # rightmost of the lowest importance

@@ -226,7 +226,23 @@ class Layout(unittest.TestCase):
                     context_window=context(262_000), cost={"total_cost_usd": 123.45,
                     "total_duration_ms": 36_000_000, "total_lines_added": 4000, "total_lines_removed": 900})
         for cols in range(70, 260):
-            self.assertLessEqual(statusline.visible_len(render_at(cols, **long)), cols, cols)
+            width = statusline.visible_len(render_at(cols, **long))
+            self.assertLessEqual(width, cols - statusline.RESERVE, cols)
+
+    def test_directory_comes_before_the_session_name(self):
+        with mock.patch.object(statusline, "git_info", return_value=GIT):
+            out = strip(render_at(300, session_name="gateway"))
+        self.assertLess(out.index("(main"), out.index("gateway"))
+
+    def test_session_name_is_the_first_segment_to_drop(self):
+        # One fixed gauge tier, so only the segment set can change with the width.
+        full = dict(session_name="gateway", context_window=context(215_000))
+        with mock.patch.object(statusline, "GAUGE_TIERS", ((0, 12, 0),)):
+            fits = statusline.visible_len(render_at(400, **full)) + statusline.RESERVE
+            self.assertIn("gateway", strip(render_at(fits, **full)))
+            out = strip(render_at(fits - 1, **full))
+        self.assertNotIn("gateway", out)
+        self.assertIn("+10 −2", out)
 
     def test_window_percentage_drops_before_the_limits(self):
         for cols in range(40, 200):
