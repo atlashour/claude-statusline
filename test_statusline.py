@@ -22,9 +22,10 @@ import statusline                      # noqa: E402
 import subagent_statusline             # noqa: E402
 
 # Glyphs the scripts may draw beyond printable ASCII. Anything else risks a font fallback.
-DRAWN_GLYPHS = set("█░│·−…↑↓◬◷⟳▸✓✗")
+DRAWN_GLYPHS = set("█▌▓░⣿│·−…↑↓◷⟳▸✓✗")
 # Glyphs missing from common terminal fonts: the fallback may be wider than a cell.
-FALLBACK_GLYPHS = set("◬◷⟳")
+FALLBACK_GLYPHS = set("◷⟳")
+GAUGE_GLYPHS = set("█▌▓░⣿")
 GIT = {"branch": "main", "dirty": True, "ahead": 2, "behind": 1}
 
 
@@ -65,6 +66,20 @@ def render_at(cols, **over):
 
 def context(tokens, window=1_000_000):
     return {"total_input_tokens": tokens, "context_window_size": window}
+
+
+def context_gauge(text):
+    """The first run of gauge glyphs: the context gauge, which precedes the 5h gauge."""
+    visible = strip(text)
+    start = next(i for i, ch in enumerate(visible) if ch in GAUGE_GLYPHS)
+    end = start
+    while end < len(visible) and visible[end] in GAUGE_GLYPHS:
+        end += 1
+    return visible[start:end]
+
+
+def gauge_start(text):
+    return next(i for i, ch in enumerate(strip(text)) if ch in GAUGE_GLYPHS)
 
 
 def strip(s):
@@ -127,24 +142,28 @@ class SessionName(unittest.TestCase):
 
 class ContextGauge(unittest.TestCase):
     def test_gauge_has_the_width_of_its_tier(self):
-        for cols in (80, 150, 186, 240):
+        for cols in (80, 150, 170, 186, 240):
             ctx_w, _ = statusline.gauge_widths(cols)
-            out = strip(render_at(cols, context_window=context(125_000)))
-            drawn = out.split("/250k ", 1)[1].split(" ", 1)[0]
-            half = round(ctx_w / 2)
-            self.assertEqual(drawn, "█" * half + "░" * (ctx_w - half), cols)
+            self.assertEqual(len(context_gauge(render_at(cols, context_window=context(125_000)))), ctx_w, cols)
+
+    def test_context_widths_put_the_ordinary_ceiling_on_a_cell_edge(self):
+        for _, ctx_w, _ in statusline.GAUGE_TIERS:
+            self.assertEqual(ctx_w % 5, 0, ctx_w)
 
     def test_gauge_width_ignores_the_data(self):
         # Widths come from COLUMNS alone, so a refresh can never make the gauge jump.
         states = [dict(context_window=context(t), cost={"total_cost_usd": c},
                        rate_limits={"five_hour": {"used_percentage": p, "resets_at": 1787000000}})
-                  for t in (0, 150_000, 400_000) for c in (0, 999.99) for p in (5, 85, 100)]
+                  for t in (0, 150_000, 450_000, 900_000) for c in (0, 999.99) for p in (5, 85, 100)]
         widths = set()
         with mock.patch.dict(os.environ, {"COLUMNS": "186"}):
             for s in states:
-                ctx_gauge = strip(statusline.render(payload(**s))).split("ctx ", 1)[1].split("%", 1)[0]
-                widths.add(ctx_gauge.count("█") + ctx_gauge.count("░"))
+                widths.add(len(context_gauge(statusline.render(payload(**s)))))
         self.assertEqual(widths, {statusline.gauge_widths(186)[0]})
+
+    def test_gauge_starts_at_the_same_column_as_the_count_grows(self):
+        starts = {gauge_start(render_at(200, context_window=context(t))) for t in (0, 9_000, 312_000, 1_250_000)}
+        self.assertEqual(len(starts), 1)
 
     def test_gauge_tiers_never_shrink_when_widening(self):
         widths = [statusline.gauge_widths(c) for c in range(-5, 400)]
@@ -152,35 +171,90 @@ class ContextGauge(unittest.TestCase):
             series = [w[field] for w in widths]
             self.assertEqual(series, sorted(series))
 
-    def test_budget_is_clamped_to_the_window(self):
-        self.assertIn("/160k", strip(render_at(200, context_window=context(10_000, 200_000))))
+    def test_colour_changes_exactly_at_the_two_ceilings(self):
+        for tokens, colour in ((399_999, statusline.GREEN), (400_000, statusline.AMBER),
+                               (499_999, statusline.AMBER), (500_000, statusline.RED)):
+            out = render_at(200, context_window=context(tokens))
+            self.assertIn(f"\033[{colour}m{statusline.tokens(tokens):>4}", out, tokens)
 
-    def test_saturation_is_flagged_in_red(self):
-        out = render_at(200, context_window=context(300_000, 200_000))
-        self.assertIn("saturated", strip(out))
-        self.assertIn(f"\033[{statusline.RED}m◬ saturated", out)
+    def test_ceilings_are_clamped_to_the_window(self):
+        # A 200k window: absolute 160k (0.8 of the window), ordinary 128k.
+        for tokens, colour in ((127_999, statusline.GREEN), (128_000, statusline.AMBER),
+                               (159_999, statusline.AMBER), (160_000, statusline.RED)):
+            out = render_at(200, context_window=context(tokens, 200_000))
+            self.assertIn(f"\033[{colour}m{statusline.tokens(tokens):>4}", out, tokens)
+
+    def test_unknown_window_uses_the_absolute_ceiling(self):
+        out = render_at(200, context_window={"total_input_tokens": 450_000})
+        self.assertIn(f"\033[{statusline.AMBER}m450k", out)
+
+    def test_bar_is_full_only_at_the_absolute_ceiling(self):
+        self.assertIn("⣿", context_gauge(render_at(200, context_window=context(499_999))))
+        for tokens in (500_000, 2_000_000):
+            gauge = context_gauge(render_at(200, context_window=context(tokens)))
+            self.assertEqual(set(gauge), {"█", "▓"}, tokens)
+
+    def test_last_mile_has_its_own_texture(self):
+        # 25 cells: 20 before the ordinary ceiling, 5 in the last mile, each 20k wide.
+        def at(tokens):
+            return statusline.context_gauge(tokens, 500_000, 25, statusline.GREEN)
+        self.assertEqual(strip(at(0)), "░" * 20 + "⣿" * 5)
+        self.assertEqual(strip(at(390_000)), "█" * 19 + "▌" + "⣿" * 5)
+        self.assertEqual(strip(at(400_000)), "█" * 20 + "⣿" * 5)
+        self.assertEqual(strip(at(450_000)), "█" * 20 + "▓" * 2 + "⣿" * 3)
+        self.assertEqual(strip(at(499_999)), "█" * 20 + "▓" * 4 + "⣿")
+        self.assertEqual(strip(at(500_000)), "█" * 20 + "▓" * 5)
+
+    def test_count_is_floored_so_no_ceiling_shows_early(self):
+        self.assertEqual(statusline.tokens(399_600), "399k")
+        self.assertEqual(statusline.tokens(999), "999")
+        self.assertEqual(statusline.tokens(999_999), "999k")
+        self.assertEqual(statusline.tokens(1_250_000), "1.2M")
+        self.assertEqual(statusline.tokens(12_345_678), "12M")
+
+    def test_segment_is_count_and_gauge_only(self):
+        out = strip(render_at(240, context_window=context(450_000)))
+        for word in ("ctx", "%", " of ", "/500k", "/400k", "saturated", "◬"):
+            self.assertNotIn(word, out.split("│ 5h", 1)[0])
+
+    def test_bars_use_the_darker_shade_and_the_count_the_theme_colour(self):
+        out = render_at(240, context_window=context(450_000),
+                        rate_limits={"five_hour": {"used_percentage": 10}})
+        self.assertIn(f"\033[{statusline.AMBER}m450k", out)
+        self.assertIn(f"\033[{statusline.BAR[statusline.AMBER]}m█", out)
+        self.assertIn(f"\033[{statusline.BAR[statusline.GREEN]}m█", out)     # the 5h gauge
+
+    def test_model_name_is_bold_claude_orange(self):
+        self.assertIn(f"\033[1;{statusline.CLAUDE}mOpus\033[0m", render_at(200))
 
     def test_state_colours_are_never_bold(self):
         # Many terminals render bold colours in their bright variant: one state, one tone.
-        out = render_at(240, context_window=context(300_000, 200_000),
+        out = render_at(240, context_window=context(600_000, 1_000_000),
                         rate_limits={"five_hour": {"used_percentage": 95, "resets_at": 1787000000}})
-        for colour in (statusline.GREEN, statusline.AMBER, statusline.RED):
+        for colour in (statusline.GREEN, statusline.AMBER, statusline.RED, *statusline.BAR.values()):
             self.assertNotIn(f"\033[1;{colour}m", out)
-
-    def test_colour_follows_the_displayed_percentage(self):
-        # 149_000 / 250k is 59.6%, displayed as 60%: it must already be amber.
-        out = render_at(200, context_window=context(149_000))
-        self.assertIn(f"\033[{statusline.AMBER}m60%", out)
 
     def test_huge_token_counts_are_displayed_in_millions(self):
         self.assertEqual(statusline.human(999_500), "1M")
         self.assertEqual(statusline.human(1_250_000), "1.25M")
         self.assertEqual(statusline.human(250_000), "250k")
 
+    def test_tiny_windows_start_green_and_empty(self):
+        for window in (1, 2, 5):
+            part = statusline.context_part(0, window, 10)
+            self.assertIn(f"\033[{statusline.GREEN}m", part, window)
+            self.assertEqual(context_gauge(part), "░" * 8 + "⣿" * 2, window)
+
+    def test_narrow_gauges_keep_their_width(self):
+        for width in (1, 2, 3, 4):
+            for used in (0, 399_999, 400_000, 450_000, 499_999, 500_000):
+                gauge = strip(statusline.context_gauge(used, 500_000, width, statusline.GREEN))
+                self.assertEqual(len(gauge), width, (width, used))
+
     def test_negative_tokens_draw_an_empty_gauge(self):
-        out = strip(render_at(100, context_window=context(-100_000)))
-        ctx_segment = out.split("ctx ", 1)[1].split("│", 1)[0]
-        self.assertTrue(ctx_segment.startswith("0/250k " + "░" * 12 + " 0%"), ctx_segment)
+        out = render_at(100, context_window=context(-100_000))
+        self.assertEqual(context_gauge(out), "░" * 8 + "⣿" * 2)
+        self.assertIn("   0 ", strip(out))
 
     def test_negative_columns_still_render(self):
         with mock.patch.dict(os.environ, {"COLUMNS": "-5"}):
@@ -237,18 +311,12 @@ class Layout(unittest.TestCase):
     def test_session_name_is_the_first_segment_to_drop(self):
         # One fixed gauge tier, so only the segment set can change with the width.
         full = dict(session_name="gateway", context_window=context(215_000))
-        with mock.patch.object(statusline, "GAUGE_TIERS", ((0, 12, 0),)):
+        with mock.patch.object(statusline, "GAUGE_TIERS", ((0, 10, 0),)):
             fits = statusline.visible_len(render_at(400, **full)) + statusline.RESERVE
             self.assertIn("gateway", strip(render_at(fits, **full)))
             out = strip(render_at(fits - 1, **full))
         self.assertNotIn("gateway", out)
         self.assertIn("+10 −2", out)
-
-    def test_window_percentage_drops_before_the_limits(self):
-        for cols in range(40, 200):
-            out = strip(render_at(cols, context_window=context(215_000)))
-            if "5h" not in out:
-                self.assertNotIn(" of ", out, cols)
 
     def test_cost_duration_and_lines_read_as_one_group(self):
         out = strip(render_at(300))
@@ -306,7 +374,7 @@ class FailureContainment(unittest.TestCase):
     def test_non_finite_numbers_still_render_the_gauge(self):
         d = json.loads('{"context_window": {"total_input_tokens": Infinity, "used_percentage": NaN}}')
         out = strip(statusline.render(d))
-        self.assertIn("ctx", out)
+        self.assertTrue(context_gauge(out))
         for word in ("n/a", "nan", "inf"):
             self.assertNotIn(word, out)
 
@@ -314,7 +382,7 @@ class FailureContainment(unittest.TestCase):
         big = 10 ** 400                        # float() raises OverflowError, not ValueError
         out = strip(statusline.render({"context_window": {"total_input_tokens": big},
                                        "cost": {"total_cost_usd": big, "total_duration_ms": 5000}}))
-        self.assertIn("ctx", out)
+        self.assertTrue(context_gauge(out))
         self.assertIn("◷ 5s", out)
 
     def test_process_exits_zero_on_garbage_stdin(self):
@@ -367,13 +435,27 @@ class SubagentRows(unittest.TestCase):
         del task["label"]
         self.assertIn("Explore", contents(tasks_payload(task))[0])
 
-    def test_row_shows_context_usage_when_the_model_is_resolved(self):
-        self.assertIn("24%", contents(tasks_payload(a_task()))[0])
+    def test_row_shows_count_and_gauge_when_the_model_is_resolved(self):
+        row = contents(tasks_payload(a_task()))[0]
+        self.assertIn(" 48k ", row)
+        self.assertEqual(len(context_gauge(row)), subagent_statusline.BAR_W)
+        self.assertNotIn("%", row)
 
-    def test_row_omits_context_usage_when_the_model_is_unresolved(self):
+    def test_row_shows_only_the_count_when_the_model_is_unresolved(self):
         task = a_task()
         del task["contextWindowSize"]
-        self.assertNotIn("%", contents(tasks_payload(task))[0])
+        row = contents(tasks_payload(task))[0]
+        self.assertIn("48k", row)
+        self.assertFalse(GAUGE_GLYPHS & set(row))
+
+    def test_row_gauge_follows_the_task_ceilings(self):
+        # 200k window: ordinary 128k, absolute 160k, as on the main line.
+        for tokens, colour in ((127_999, statusline.GREEN), (128_000, statusline.AMBER),
+                               (160_000, statusline.RED)):
+            row = json.loads(subagent_statusline.render_rows(
+                tasks_payload(a_task(tokenCount=tokens)))[0])["content"]
+            self.assertIn(f"\033[{colour}m{statusline.tokens(tokens):>4}", row, tokens)
+            self.assertIn(f"\033[{statusline.BAR[colour]}m", row, tokens)
 
     def test_row_shows_effort_when_set(self):
         self.assertIn("high", contents(tasks_payload(a_task()))[0])
@@ -394,26 +476,47 @@ class SubagentRows(unittest.TestCase):
     def test_columns_align_across_rows(self):
         rows = contents(tasks_payload(a_task(id="a", label="x"), a_task(id="b", label="a-longer-label",
                                                                           model="claude-haiku-4-5-20251001")))
-        self.assertEqual(rows[0].index("%"), rows[1].index("%"))
+        self.assertEqual(gauge_start(rows[0]), gauge_start(rows[1]))
 
     def test_a_hostile_sibling_shifts_the_columns_by_a_bounded_amount(self):
         # Sibling fields are elided to fixed budgets, so no task can push the others off screen.
         alone = contents(tasks_payload(a_task(id="a")))
         crowded = contents(tasks_payload(a_task(id="a"), {"id": "x", "label": "z" * 90, "tokenCount": 1e300,
                                                           "contextWindowSize": 1, "effort": "y" * 90}))
-        shift = crowded[0].index("%") - alone[0].index("%")
+        shift = gauge_start(crowded[0]) - gauge_start(alone[0])
         self.assertLessEqual(shift, (subagent_statusline.NAME_MAX - len("explore:parser"))
                              + (subagent_statusline.META_MAX - len("opus-5 high")))
 
     def test_narrow_panel_gives_up_alignment_to_keep_the_description(self):
         tasks = (a_task(id="a"), a_task(id="b", label="a-much-longer-label"))
         wide, narrow = contents(tasks_payload(*tasks, columns=120)), contents(tasks_payload(*tasks, columns=70))
-        self.assertEqual(wide[0].index("%"), wide[1].index("%"))
-        self.assertNotEqual(narrow[0].index("%"), narrow[1].index("%"))
+        self.assertEqual(gauge_start(wide[0]), gauge_start(wide[1]))
+        self.assertNotEqual(gauge_start(narrow[0]), gauge_start(narrow[1]))
         self.assertIn("locate the", narrow[0])
 
-    def test_saturated_task_is_flagged(self):
-        self.assertIn("◬", contents(tasks_payload(a_task(tokenCount=250_000)))[0])
+    def test_packed_rows_drop_the_count_padding(self):
+        rows = contents(tasks_payload(a_task(id="a", tokenCount=5_000),
+                                      a_task(id="b", label="a-much-longer-label"), columns=70))
+        self.assertIn("opus-5 high  5k ", rows[0])
+
+    def test_rows_still_align_without_the_main_script(self):
+        # A failed import must degrade to plain text, never to ragged columns.
+        code = ("import sys, json; sys.modules['statusline'] = None; sys.path.insert(0, sys.argv[1]);"
+                "import subagent_statusline as s;"
+                "t = lambda i, **o: dict({'id': i, 'label': i, 'model': 'claude-opus-5', 'description': 'desc'}, **o);"
+                "rows = s.render_rows({'columns': 120, 'tasks': [t('a', contextWindowSize=1e6, tokenCount=5000),"
+                "t('b', contextWindowSize=1e6, tokenCount=1250000), t('c', tokenCount=12000)]});"
+                "print(json.dumps([json.loads(r)['content'].index('desc') for r in rows]))")
+        r = subprocess.run([sys.executable, "-X", "utf8", "-c", code, HERE],
+                           capture_output=True, encoding="utf-8", timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(set(json.loads(r.stdout))), 1, r.stdout)
+
+    def test_task_past_its_ceiling_has_a_full_red_bar(self):
+        row = json.loads(subagent_statusline.render_rows(
+            tasks_payload(a_task(tokenCount=250_000)))[0])["content"]
+        self.assertIn(f"\033[{statusline.RED}m250k", row)
+        self.assertEqual(set(context_gauge(row)), {"█", "▓"})
 
     def test_failed_task_glyph_is_red(self):
         row = json.loads(subagent_statusline.render_rows(tasks_payload(a_task(status="failed")))[0])["content"]

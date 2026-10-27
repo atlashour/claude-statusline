@@ -2,14 +2,16 @@
 """Subagent status line: one row per visible subagent in the agent panel.
 
 Row, left to right: status (▸ running, · pending, ✓ done, ✗ failed), label, model and
-explicit effort, context gauge against the task's own window, tokens, description.
+explicit effort, tokens and context gauge, description. The gauge is the main line's: the
+same two ceilings, clamped to the task's own window.
 
 Columns align across the rows of one payload while the panel is wide enough to keep
 MIN_DESC cells of description; otherwise rows pack tightly. Parts drop from the right
 when a row does not fit `columns`, which the harness declares (narrower than the terminal).
 
 The gauge appears only once `contextWindowSize` is present, that is once the task's model
-resolved (Claude Code 2.1.205+); a percentage against a guessed window would mislead.
+resolved (Claude Code 2.1.205+); ceilings from a guessed window would mislead, so until
+then the row shows the muted token count alone.
 Effort appears only when set explicitly (2.1.214+); absent means inherited.
 
 Styling comes from statusline.py so both share one visual language. If that import fails,
@@ -27,12 +29,20 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from statusline import (BOLD, GREEN, RED, RESET, VERSION, clean, elide, gauge, human,
-                            muted, num, paint, state_colour, visible_len)
+    from statusline import (BOLD, GREEN, RED, RESET, VERSION, clean, context_part as gauge_part,
+                            elide, human, muted, num, paint, tokens, visible_len)
 except Exception:                                    # degrade to plain text, never disappear
     VERSION = "unknown"
     BOLD = RESET = ""
     GREEN = RED = ""
+
+    def tokens(n):
+        n = int(max(0, n))
+        if n < 1_000:
+            return str(n)
+        if n < 1_000_000:
+            return f"{n // 1_000}k"
+        return f"{n // 100_000 / 10:.1f}M" if n < 10_000_000 else f"{n // 1_000_000}M"
 
     def num(x, default=0.0):
         try:
@@ -59,25 +69,19 @@ except Exception:                                    # degrade to plain text, ne
     def muted(s):
         return s
 
-    def gauge(frac, width, colour):
-        return ""
-
-    def state_colour(pct, warn, hot):
-        return ""
+    def gauge_part(used, window, width, count_cells=4):
+        return tokens(used).rjust(count_cells) + " " * (width + 1)
 
 # --- Tunables ----------------------------------------------------------------
-BAR_W         = 8     # gauge cells
-WARN_PCT      = 60    # gauge turns amber at this % of the task's window
-HOT_PCT       = 85    # ...and red here
+BAR_W         = 10    # gauge cells; a multiple of 5 so the ordinary ceiling is a cell edge
 NAME_MAX      = 22    # display cells for the label
 META_MAX      = 16    # display cells for model and effort
 MIN_DESC      = 20    # description cells kept before alignment is given up
 FALLBACK_COLS = 80
 # -------------------------------------------------------------------------------
 
-PCT_MAX = 999
 MAX_TOKENS = 999_000_000
-GAUGE_CELLS = BAR_W + 7          # gauge, space, "100%", space, "◬"
+GAUGE_CELLS = 5 + BAR_W          # count right-aligned in 4 cells, space, gauge
 STATUS = {"running": ("▸", None), "pending": ("·", None), "queued": ("·", None),
           "completed": ("✓", GREEN), "done": ("✓", GREEN),
           "failed": ("✗", RED), "error": ("✗", RED)}
@@ -109,23 +113,27 @@ def describe(task: dict) -> dict:
         shown = human(min(budget, MAX_TOKENS)) if budget > 0 else ""
     else:
         shown = clean(effort).strip()
-    tokens = max(0.0, min(num(task.get("tokenCount"), 0), MAX_TOKENS))
     return {
         "status": str(task.get("status") or "").lower(),
         "label": elide(label, NAME_MAX),
         "meta": elide(f"{short_model(clean(task.get('model') or ''))} {shown}".strip(), META_MAX),
-        "window": max(0.0, num(task.get("contextWindowSize"), 0)),
-        "tokens": tokens,
-        "tokens_txt": human(tokens) if tokens > 0 else "",
+        "window": int(max(0.0, min(num(task.get("contextWindowSize"), 0), MAX_TOKENS))),
+        "tokens": int(max(0.0, min(num(task.get("tokenCount"), 0), MAX_TOKENS))),
         "desc": clean(task.get("description") or "").strip(),
     }
 
 
-def context_part(row: dict) -> str:
-    pct = max(0, min(PCT_MAX, round(row["tokens"] / row["window"] * 100)))
-    colour = state_colour(pct, WARN_PCT, HOT_PCT)
-    mark = " " + paint("◬", RED) if pct >= 100 else "  "
-    return f"{gauge(pct / 100, BAR_W, colour)} {paint(f'{pct:>3}%', colour)}{mark}"
+def context_part(row: dict, aligned: bool) -> str:
+    """Count and gauge; without a window, the muted count alone.
+
+    Aligned, the part always takes GAUGE_CELLS so the description column lines up;
+    otherwise it is as short as its content.
+    """
+    cells = GAUGE_CELLS - BAR_W - 1 if aligned else 0
+    if row["window"] > 0:
+        return gauge_part(row["tokens"], row["window"], BAR_W, cells)
+    count = muted(tokens(row["tokens"]).rjust(cells)) if row["tokens"] > 0 else " " * cells
+    return count + " " * (BAR_W + 1) if aligned else count
 
 
 def pad(s: str, width: int) -> str:
@@ -141,17 +149,13 @@ def render_row(row: dict, columns: int, widths=None) -> str:
         head = pad(head, widths["label"] + 2)
         if widths["meta"]:
             parts.append(muted(pad(row["meta"], widths["meta"])))
-        if widths["gauge"]:
-            parts.append(context_part(row) if row["window"] > 0 else " " * GAUGE_CELLS)
-        if widths["tokens"]:
-            parts.append(muted(row["tokens_txt"].rjust(widths["tokens"])))
+        if widths["context"]:
+            parts.append(context_part(row, aligned=True))
     else:
         if row["meta"]:
             parts.append(muted(row["meta"]))
-        if row["window"] > 0:
-            parts.append(context_part(row).rstrip())
-        if row["tokens_txt"]:
-            parts.append(muted(row["tokens_txt"]))
+        if row["window"] > 0 or row["tokens"] > 0:
+            parts.append(context_part(row, aligned=False))
 
     while True:
         line = "  ".join([head] + parts)
@@ -186,13 +190,11 @@ def render_rows(d: dict) -> list:
     widths = {
         "label": max((visible_len(r["label"]) for r in rows_only), default=0),
         "meta": max((visible_len(r["meta"]) for r in rows_only), default=0),
-        "gauge": any(r["window"] > 0 for r in rows_only),
-        "tokens": max((len(r["tokens_txt"]) for r in rows_only), default=0),
+        "context": any(r["window"] > 0 or r["tokens"] > 0 for r in rows_only),
     }
     needed = (2 + widths["label"] + MIN_DESC
               + (widths["meta"] + 2 if widths["meta"] else 0)
-              + (GAUGE_CELLS + 2 if widths["gauge"] else 0)
-              + (widths["tokens"] + 2 if widths["tokens"] else 0) + 2)
+              + (GAUGE_CELLS + 2 if widths["context"] else 0) + 2)
 
     rows = []
     for tid, row in described:

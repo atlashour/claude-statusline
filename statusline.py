@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
 """Claude Code status line: model, location, context gauge, rate limits, session totals.
 
-The context gauge measures usage against a comfort budget, not the context window:
-COMFORT_ABS tokens, clamped to COMFORT_FRAC of the real window so it never promises
-headroom the window does not have. Quality degrades in absolute terms, whatever the
-window size.
+The context segment is the token count and a gauge against two ceilings, not against the
+context window: quality degrades in absolute terms, whatever the window size.
+- The absolute ceiling is CEILING_ABS tokens, clamped to CEILING_FRAC of the real window so
+  it stays below the point where Claude Code compacts. The gauge spans 0..absolute and is
+  full only there.
+- The ordinary ceiling is ORDINARY_FRAC of the absolute one (400k of 500k).
+- Green below the ordinary ceiling, amber up to the absolute one, red from it. The count is
+  floored, so it never shows a ceiling before the ceiling is crossed (399_600 -> "399k").
+- Before the ordinary ceiling the gauge fills in half cells (█ ▌) over a ░ track. The last
+  mile has less air: ▓ in whole cells over a ⣿ track.
 
 Rendering rules:
 - Colour is state, never decoration: the theme's green, yellow and red by each metric's
-  own thresholds, compared against the rounded percentage that is displayed. Red means
-  alarm. Secondary text uses explicit greys: Claude Code already dims the whole line, so
-  SGR dim would carry no hierarchy.
+  own thresholds, compared against the rounded value that is displayed. Red means alarm.
+  Bars use a darker xterm-256 shade of their state (BAR) so they stay quiet next to the
+  numbers. Secondary text uses explicit greys: Claude Code already dims the whole line, so
+  SGR dim would carry no hierarchy. The model name alone is bold Claude orange.
 - Gauge widths depend on COLUMNS alone (GAUGE_TIERS), so they never change between
-  refreshes of the same terminal. Only the 5h limit gets a gauge.
+  refreshes of the same terminal. Context widths are multiples of 5, which puts the
+  ordinary ceiling on a cell edge. Only the 5h limit gets a gauge.
 - The line is fitted to COLUMNS minus RESERVE: Claude Code draws the status line inside its
   own margins and truncates anything wider with an ellipsis.
 - When the line does not fit, segments drop by priority: session name, lines changed,
-  duration, cost, window percentage, directory, rate limits. Model and gauge never drop.
+  duration, cost, directory, rate limits. Model and context never drop.
   The session name goes first because Claude Code already shows a name set with --name
   or /rename on the prompt bar.
-- Glyphs that common terminal fonts lack (◬ ◷ ⟳) are followed by a space: their fallback
-  glyph can be wider than one cell and would otherwise overlap the next character.
+- Glyphs that common terminal fonts lack (◷ ⟳) are followed by a space: their fallback
+  glyph can be wider than one cell and would otherwise overlap the next character. The ⣿
+  track is drawn from a fallback font too where the main one has no braille (Berkeley
+  Mono); braille is single width in every fallback font, so it needs no space.
 - State colours are never bold: many terminals draw bold colours in their bright variant,
   which would split one state into two tones.
 
@@ -42,12 +52,12 @@ import unicodedata
 from datetime import datetime
 
 # --- Tunables ----------------------------------------------------------------
-VERSION       = "5.1.1"  # reported by --version; never drawn on the line
+VERSION       = "6.0.0"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to the session name
 MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
-COMFORT_ABS   = 250_000  # absolute comfort budget (tokens)
-COMFORT_FRAC  = 0.80     # ...never above this fraction of the real window
-WARN_FRAC     = 0.60     # context turns amber at this fraction of the budget
+CEILING_ABS   = 500_000  # absolute context ceiling (tokens): red from here, the gauge's end
+CEILING_FRAC  = 0.80     # ...never above this fraction of the real window
+ORDINARY_FRAC = 0.80     # ordinary ceiling as a fraction of the absolute one: amber from here
 LIMIT_WARN    = 60       # rate limit %: amber from here
 LIMIT_HOT     = 85       # rate limit %: red, and the reset time appears
 GIT_TTL       = 5.0      # seconds to reuse a cached `git status`
@@ -56,9 +66,12 @@ RESERVE       = 4        # columns Claude Code keeps for its margins (measured o
 # (minimum columns, context gauge cells, 5h limit gauge cells; 0 shows the 5h limit as text).
 # Measured so wider gauges never cost a segment other than the session name, even for a
 # heavy session: a 20-cell name, $87, 5h 30m, +3000 -900 lines and the reset time shown.
-GAUGE_TIERS   = ((187, 28, 10), (181, 24, 8), (175, 20, 6), (167, 20, 0), (163, 16, 0), (0, 12, 0))
+# Context widths are multiples of 5 so the ordinary ceiling lands on a cell edge.
+GAUGE_TIERS   = ((187, 25, 10), (181, 25, 8), (175, 20, 6), (167, 20, 0), (163, 15, 0), (0, 10, 0))
 # SGR parameters. States use the terminal theme's own palette; greys are fixed xterm-256.
 GREEN, AMBER, RED = "32", "33", "31"
+BAR = {GREEN: "38;5;28", AMBER: "38;5;136", RED: "38;5;124"}  # darker shade of each state
+CLAUDE = "38;2;215;119;87"     # Claude Code's own "claude" theme colour, for the model name
 SEP, MUTED = "38;5;240", "38;5;245"
 # -------------------------------------------------------------------------------
 
@@ -66,6 +79,7 @@ RESET, BOLD = "\033[0m", "\033[1m"
 PCT_MAX = 999
 MAX_TOKENS = 999_000_000
 TAIL = ("cost", "duration", "lines")
+COUNT_CELLS = 4                # "999k", "1.2M", "999M": the gauge never shifts as it grows
 
 # Keep the git subprocess from flashing a console window on Windows.
 _NOWINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
@@ -88,6 +102,18 @@ def human(n) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.0f}k"
     return str(int(n))
+
+
+def tokens(n) -> str:
+    """Floored, so a ceiling never shows before it is crossed: 399_600 -> "399k", 1_250_000 -> "1.2M"."""
+    n = int(max(0, n))
+    if n < 1_000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n // 1_000}k"
+    if n < 10_000_000:
+        return f"{n // 100_000 / 10:.1f}M"
+    return f"{n // 1_000_000}M"
 
 
 def visible_len(s: str) -> int:
@@ -169,14 +195,48 @@ def state_colour(pct: int, warn: int, hot: int) -> str:
 
 
 def gauge(frac: float, width: int, colour: str) -> str:
-    """`width` cells of █ (used) and ░ (free) in the state colour."""
+    """`width` cells of █ (used) and ░ (free) in the bar shade of the state colour."""
     fill = round(max(0.0, min(1.0, frac)) * width)
-    return paint("█" * fill + "░" * (width - fill), colour)
+    return paint("█" * fill + "░" * (width - fill), BAR.get(colour, colour))
+
+
+def context_gauge(used: int, ceiling: int, width: int, colour: str) -> str:
+    """0..ceiling in two zones split at the ordinary ceiling (a cell edge: width is a multiple of 5).
+
+    Before it: half-cell fill █ ▌ on a ░ track. The last mile has less air: ▓ on a ⣿ track,
+    in whole cells. The bar is full only at the ceiling itself, so a full bar always means red.
+    """
+    notch = round(width * ORDINARY_FRAC)
+    ordinary = max(1, int(ceiling * ORDINARY_FRAC))
+    if used >= ceiling:
+        cells = "█" * notch + "▓" * (width - notch)
+    elif used < ordinary:
+        full, half = divmod(used * 2 * width // ceiling, 2)
+        cells = "█" * full + ("▌" if half else "")
+        cells += "░" * (notch - len(cells)) + "⣿" * (width - notch)
+    else:
+        last = max(0, min((used - ordinary) * (width - notch) // max(1, ceiling - ordinary),
+                          width - notch - 1))
+        cells = "█" * notch + "▓" * last + "⣿" * (width - notch - last)
+    return paint(cells, BAR.get(colour, colour))
+
+
+def context_part(used: int, window: int, width: int, count_cells: int = COUNT_CELLS) -> str:
+    """Count and gauge against the two ceilings of `window` (0: unknown, the absolute ceiling).
+
+    The count is right-aligned in `count_cells` (0: unpadded) so a column of them lines up.
+    """
+    ceiling = max(1, min(CEILING_ABS, int(window * CEILING_FRAC)) if window else CEILING_ABS)
+    ordinary = max(1, int(ceiling * ORDINARY_FRAC))
+    colour = GREEN if used < ordinary else AMBER if used < ceiling else RED
+    count = paint(tokens(used).rjust(count_cells), colour)
+    return f"{count} {context_gauge(used, ceiling, width, colour)}"
 
 
 def gauge_widths(cols: int):
     """(context gauge cells, 5h limit gauge cells) for a terminal `cols` wide."""
-    return next(((ctx, limit) for min_cols, ctx, limit in GAUGE_TIERS if cols >= min_cols), (12, 0))
+    return next(((ctx, limit) for min_cols, ctx, limit in GAUGE_TIERS if cols >= min_cols),
+                GAUGE_TIERS[-1][1:])
 
 
 # --- Git -----------------------------------------------------------------------
@@ -270,9 +330,7 @@ def _join(segments) -> str:
     out, prev = "", None
     for _, key, text in segments:
         if prev is not None:
-            if key == "window":
-                pass                           # the window percentage trails the gauge
-            elif key in TAIL and prev in TAIL:
+            if key in TAIL and prev in TAIL:
                 out += "  "                    # cost, duration and lines read as one group
             else:
                 out += separator
@@ -301,30 +359,14 @@ def render(d: dict) -> str:
                    ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
     used = int(max(0.0, min(used, MAX_TOKENS)))
     window = int(max(0.0, min(num(cw.get("context_window_size"), 0), MAX_TOKENS)))
-    wp = num(cw.get("used_percentage"), None)
-    win_pct = round(wp) if wp is not None else (round(used / window * 100) if window else 0)
-    win_pct = max(0, min(PCT_MAX, win_pct))
-
-    comfort = max(1, min(COMFORT_ABS, int(window * COMFORT_FRAC)) if window else COMFORT_ABS)
-    pct = min(PCT_MAX, round(used / comfort * 100))
-    colour = state_colour(pct, round(WARN_FRAC * 100), 100)
-    saturated = pct >= 100
 
     # --- core segments: never dropped ------------------------------------------
     model = elide(clean(obj(d, "model").get("display_name") or "Claude"), MODEL_MAX)
     effort = obj(d, "effort").get("level")
-    model_seg = f"{BOLD}{model}{RESET}" + (f" {muted(clean(effort))}" if effort else "")
-
-    used_txt = paint(human(used), RED) if saturated else human(used)
-    ctx_seg = (f"{muted('ctx')} {used_txt}{muted('/' + human(comfort))} "
-               f"{gauge(pct / 100, ctx_w, colour)} {paint(f'{pct}%', colour)}")
-    if saturated:
-        ctx_seg += " " + paint("◬ saturated", RED)
+    model_seg = paint(model, CLAUDE, bold=True) + (f" {muted(clean(effort))}" if effort else "")
+    ctx_seg = context_part(used, window, ctx_w)
 
     # --- optional segments: bad data drops the segment, never the line ----------
-    def build_window() -> str:
-        return muted(f" · {win_pct}% of {human(window)}") if window else ""
-
     def build_session() -> str:
         name = clean(d.get("session_name") or "").strip()
         return muted(elide(name, SESSION_MAX)) if name else ""
@@ -389,13 +431,12 @@ def render(d: dict) -> str:
     segments = [
         (0, "model", model_seg),
         (2, "location", safe(build_location)),
-        (7, "session", safe(build_session)),
+        (6, "session", safe(build_session)),
         (0, "context", ctx_seg),
-        (3, "window", safe(build_window)),
         (1, "limits", safe(build_limits)),
-        (4, "cost", safe(build_cost)),
-        (5, "duration", safe(build_duration)),
-        (6, "lines", safe(build_lines)),
+        (3, "cost", safe(build_cost)),
+        (4, "duration", safe(build_duration)),
+        (5, "lines", safe(build_lines)),
     ]
     segments = [s for s in segments if s[2]]
 
