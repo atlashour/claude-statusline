@@ -15,7 +15,7 @@ not proportional. Quality degrades somewhere past 200k tokens whether the window
 So the gauge measures usage against two ceilings instead. Up to 400k tokens is ordinary
 work. From 400k the session is on its last mile, and 500k is the wall. The gauge spans
 0 to 500k: green below 400k, yellow on the last mile, red and full from 500k. Its last
-fifth is drawn with less air, `▓` over `⣿`, so the last mile reads at a glance.
+fifth is drawn with less air, `▓` over a darker `░`, so the last mile reads at a glance.
 
 Both ceilings are capped by the real window, so they never promise room the window does
 not have: on a 200k window the wall sits at 160k (80% of the window, before compaction is
@@ -101,9 +101,7 @@ which may drop its own segment but never the line.
 
 - Built for dark terminal themes.
 - Some symbols, such as `◷` and `⟳`, are missing from many monospace fonts. Each one is
-  followed by a space, so a wider fallback glyph cannot overlap the next character. Some
-  fonts, such as Berkeley Mono, have no braille either; the terminal then draws the `⣿`
-  track from a fallback font, still one cell wide.
+  followed by a space, so a wider fallback glyph cannot overlap the next character.
 - `git status` runs at most once every 5 seconds per session.
 - `python statusline.py --version` prints the installed version. Bump `VERSION` in
   `statusline.py` whenever either script changes.

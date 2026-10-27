@@ -10,7 +10,7 @@ context window: quality degrades in absolute terms, whatever the window size.
 - Green below the ordinary ceiling, amber up to the absolute one, red from it. The count is
   floored, so it never shows a ceiling before the ceiling is crossed (399_600 -> "399k").
 - Before the ordinary ceiling the gauge fills in half cells (█ ▌) over a ░ track. The last
-  mile has less air: ▓ in whole cells over a ⣿ track.
+  mile has less air: ▓ in whole cells over the same ░ track, one shade darker.
 
 Rendering rules:
 - Colour is state, never decoration: the theme's green, yellow and red by each metric's
@@ -28,9 +28,7 @@ Rendering rules:
   The session name goes first because Claude Code already shows a name set with --name
   or /rename on the prompt bar.
 - Glyphs that common terminal fonts lack (◷ ⟳) are followed by a space: their fallback
-  glyph can be wider than one cell and would otherwise overlap the next character. The ⣿
-  track is drawn from a fallback font too where the main one has no braille (Berkeley
-  Mono); braille is single width in every fallback font, so it needs no space.
+  glyph can be wider than one cell and would otherwise overlap the next character.
 - State colours are never bold: many terminals draw bold colours in their bright variant,
   which would split one state into two tones.
 
@@ -52,7 +50,7 @@ import unicodedata
 from datetime import datetime
 
 # --- Tunables ----------------------------------------------------------------
-VERSION       = "6.0.0"  # reported by --version; never drawn on the line
+VERSION       = "6.0.1"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to the session name
 MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
 CEILING_ABS   = 500_000  # absolute context ceiling (tokens): red from here, the gauge's end
@@ -71,6 +69,7 @@ GAUGE_TIERS   = ((187, 25, 10), (181, 25, 8), (175, 20, 6), (167, 20, 0), (163, 
 # SGR parameters. States use the terminal theme's own palette; greys are fixed xterm-256.
 GREEN, AMBER, RED = "32", "33", "31"
 BAR = {GREEN: "38;5;28", AMBER: "38;5;136", RED: "38;5;124"}  # darker shade of each state
+TRACK = {GREEN: "38;5;22", AMBER: "38;5;94", RED: "38;5;88"}  # one step darker: last-mile track
 CLAUDE = "38;2;215;119;87"     # Claude Code's own "claude" theme colour, for the model name
 SEP, MUTED = "38;5;240", "38;5;245"
 # -------------------------------------------------------------------------------
@@ -203,22 +202,24 @@ def gauge(frac: float, width: int, colour: str) -> str:
 def context_gauge(used: int, ceiling: int, width: int, colour: str) -> str:
     """0..ceiling in two zones split at the ordinary ceiling (a cell edge: width is a multiple of 5).
 
-    Before it: half-cell fill █ ▌ on a ░ track. The last mile has less air: ▓ on a ⣿ track,
-    in whole cells. The bar is full only at the ceiling itself, so a full bar always means red.
+    Before it: half-cell fill █ ▌ on a ░ track. The last mile has less air: ▓ in whole cells,
+    on the same ░ track one shade darker (TRACK), so the gauge stays one solid rectangle.
+    The bar is full only at the ceiling itself, so a full bar always means red.
     """
     notch = round(width * ORDINARY_FRAC)
     ordinary = max(1, int(ceiling * ORDINARY_FRAC))
+    track = width - notch
     if used >= ceiling:
-        cells = "█" * notch + "▓" * (width - notch)
+        cells, track = "█" * notch + "▓" * (width - notch), 0
     elif used < ordinary:
         full, half = divmod(used * 2 * width // ceiling, 2)
         cells = "█" * full + ("▌" if half else "")
-        cells += "░" * (notch - len(cells)) + "⣿" * (width - notch)
+        cells += "░" * (notch - len(cells))
     else:
         last = max(0, min((used - ordinary) * (width - notch) // max(1, ceiling - ordinary),
                           width - notch - 1))
-        cells = "█" * notch + "▓" * last + "⣿" * (width - notch - last)
-    return paint(cells, BAR.get(colour, colour))
+        cells, track = "█" * notch + "▓" * last, width - notch - last
+    return paint(cells, BAR.get(colour, colour)) + paint("░" * track, TRACK.get(colour, colour))
 
 
 def context_part(used: int, window: int, width: int, count_cells: int = COUNT_CELLS) -> str:

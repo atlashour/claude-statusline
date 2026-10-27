@@ -22,10 +22,10 @@ import statusline                      # noqa: E402
 import subagent_statusline             # noqa: E402
 
 # Glyphs the scripts may draw beyond printable ASCII. Anything else risks a font fallback.
-DRAWN_GLYPHS = set("█▌▓░⣿│·−…↑↓◷⟳▸✓✗")
+DRAWN_GLYPHS = set("█▌▓░│·−…↑↓◷⟳▸✓✗")
 # Glyphs missing from common terminal fonts: the fallback may be wider than a cell.
 FALLBACK_GLYPHS = set("◷⟳")
-GAUGE_GLYPHS = set("█▌▓░⣿")
+GAUGE_GLYPHS = set("█▌▓░")
 GIT = {"branch": "main", "dirty": True, "ahead": 2, "behind": 1}
 
 
@@ -189,21 +189,26 @@ class ContextGauge(unittest.TestCase):
         self.assertIn(f"\033[{statusline.AMBER}m450k", out)
 
     def test_bar_is_full_only_at_the_absolute_ceiling(self):
-        self.assertIn("⣿", context_gauge(render_at(200, context_window=context(499_999))))
+        self.assertIn(f"[{statusline.TRACK[statusline.AMBER]}m░",
+                      render_at(200, context_window=context(499_999)))
         for tokens in (500_000, 2_000_000):
             gauge = context_gauge(render_at(200, context_window=context(tokens)))
             self.assertEqual(set(gauge), {"█", "▓"}, tokens)
 
     def test_last_mile_has_its_own_texture(self):
         # 25 cells: 20 before the ordinary ceiling, 5 in the last mile, each 20k wide.
+        # The last-mile track is the same ░ in the darker TRACK shade.
+        bar, track = statusline.BAR[statusline.GREEN], statusline.TRACK[statusline.GREEN]
         def at(tokens):
             return statusline.context_gauge(tokens, 500_000, 25, statusline.GREEN)
-        self.assertEqual(strip(at(0)), "░" * 20 + "⣿" * 5)
-        self.assertEqual(strip(at(390_000)), "█" * 19 + "▌" + "⣿" * 5)
-        self.assertEqual(strip(at(400_000)), "█" * 20 + "⣿" * 5)
-        self.assertEqual(strip(at(450_000)), "█" * 20 + "▓" * 2 + "⣿" * 3)
-        self.assertEqual(strip(at(499_999)), "█" * 20 + "▓" * 4 + "⣿")
-        self.assertEqual(strip(at(500_000)), "█" * 20 + "▓" * 5)
+        def drawn(cells, rest):
+            return statusline.paint(cells, bar) + statusline.paint("░" * rest, track)
+        self.assertEqual(at(0), drawn("░" * 20, 5))
+        self.assertEqual(at(390_000), drawn("█" * 19 + "▌", 5))
+        self.assertEqual(at(400_000), drawn("█" * 20, 5))
+        self.assertEqual(at(450_000), drawn("█" * 20 + "▓" * 2, 3))
+        self.assertEqual(at(499_999), drawn("█" * 20 + "▓" * 4, 1))
+        self.assertEqual(at(500_000), drawn("█" * 20 + "▓" * 5, 0))
 
     def test_count_is_floored_so_no_ceiling_shows_early(self):
         self.assertEqual(statusline.tokens(399_600), "399k")
@@ -231,7 +236,8 @@ class ContextGauge(unittest.TestCase):
         # Many terminals render bold colours in their bright variant: one state, one tone.
         out = render_at(240, context_window=context(600_000, 1_000_000),
                         rate_limits={"five_hour": {"used_percentage": 95, "resets_at": 1787000000}})
-        for colour in (statusline.GREEN, statusline.AMBER, statusline.RED, *statusline.BAR.values()):
+        for colour in (statusline.GREEN, statusline.AMBER, statusline.RED, *statusline.BAR.values(),
+                       *statusline.TRACK.values()):
             self.assertNotIn(f"\033[1;{colour}m", out)
 
     def test_huge_token_counts_are_displayed_in_millions(self):
@@ -243,7 +249,7 @@ class ContextGauge(unittest.TestCase):
         for window in (1, 2, 5):
             part = statusline.context_part(0, window, 10)
             self.assertIn(f"\033[{statusline.GREEN}m", part, window)
-            self.assertEqual(context_gauge(part), "░" * 8 + "⣿" * 2, window)
+            self.assertEqual(context_gauge(part), "░" * 10, window)
 
     def test_narrow_gauges_keep_their_width(self):
         for width in (1, 2, 3, 4):
@@ -253,7 +259,7 @@ class ContextGauge(unittest.TestCase):
 
     def test_negative_tokens_draw_an_empty_gauge(self):
         out = render_at(100, context_window=context(-100_000))
-        self.assertEqual(context_gauge(out), "░" * 8 + "⣿" * 2)
+        self.assertEqual(context_gauge(out), "░" * 10)
         self.assertIn("   0 ", strip(out))
 
     def test_negative_columns_still_render(self):
