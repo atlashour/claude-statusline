@@ -3,6 +3,8 @@
 A status line for Claude Code built around one number: how close the session is to the
 point where the model starts losing the thread.
 
+![The status line under four subagent rows, at 431k tokens on the last mile](docs/statusline.png)
+
 ## Why the gauge is not the context window
 
 Most status lines plot usage against the model's context window, so a 1M window sits at
