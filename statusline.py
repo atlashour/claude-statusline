@@ -20,7 +20,9 @@ Rendering rules:
   SGR dim would carry no hierarchy. The model name alone is bold Claude orange.
 - Gauge widths depend on COLUMNS alone (GAUGE_TIERS), so they never change between
   refreshes of the same terminal. Context widths are multiples of 5, which puts the
-  ordinary ceiling on a cell edge. Only the 5h limit gets a gauge.
+  ordinary ceiling on a cell edge. Only the limit that binds first gets a gauge: 5h, or 7d
+  when there is no 5h window (verified Ultra accounts have none).
+- From LIMIT_HOT a limit shows its reset time; the 7d one with its weekday.
 - The line is fitted to COLUMNS minus RESERVE: Claude Code draws the status line inside its
   own margins and truncates anything wider with an ellipsis.
 - When the line does not fit, segments drop by priority: session name, lines changed,
@@ -50,7 +52,7 @@ import unicodedata
 from datetime import datetime
 
 # --- Tunables ----------------------------------------------------------------
-VERSION       = "6.0.1"  # reported by --version; never drawn on the line
+VERSION       = "6.1.0"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to the session name
 MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
 CEILING_ABS   = 500_000  # absolute context ceiling (tokens): red from here, the gauge's end
@@ -61,7 +63,7 @@ LIMIT_HOT     = 85       # rate limit %: red, and the reset time appears
 GIT_TTL       = 5.0      # seconds to reuse a cached `git status`
 FALLBACK_COLS = 200      # assumed width when COLUMNS is absent
 RESERVE       = 4        # columns Claude Code keeps for its margins (measured on 2.1.270)
-# (minimum columns, context gauge cells, 5h limit gauge cells; 0 shows the 5h limit as text).
+# (minimum columns, context gauge cells, limit gauge cells; 0 shows every limit as text).
 # Measured so wider gauges never cost a segment other than the session name, even for a
 # heavy session: a 20-cell name, $87, 5h 30m, +3000 -900 lines and the reset time shown.
 # Context widths are multiples of 5 so the ordinary ceiling lands on a cell edge.
@@ -235,7 +237,7 @@ def context_part(used: int, window: int, width: int, count_cells: int = COUNT_CE
 
 
 def gauge_widths(cols: int):
-    """(context gauge cells, 5h limit gauge cells) for a terminal `cols` wide."""
+    """(context gauge cells, limit gauge cells) for a terminal `cols` wide."""
     return next(((ctx, limit) for min_cols, ctx, limit in GAUGE_TIERS if cols >= min_cols),
                 GAUGE_TIERS[-1][1:])
 
@@ -388,23 +390,24 @@ def render(d: dict) -> str:
 
     def build_limits() -> str:
         rl = obj(d, "rate_limits")
-        parts = []
-        for tag, key in (("5h", "five_hour"), ("7d", "seven_day")):
+        windows = []
+        for tag, key, when in (("5h", "five_hour", "%H:%M"), ("7d", "seven_day", "%a %H:%M")):
             w = obj(rl, key)                     # one malformed window drops only itself
             raw = num(w.get("used_percentage"), None)
-            if raw is None:
-                continue
-            p = max(0, min(PCT_MAX, round(raw)))
+            if raw is not None:
+                windows.append((tag, w, when, max(0, min(PCT_MAX, round(raw)))))
+        parts = []
+        for i, (tag, w, when, p) in enumerate(windows):
             c = state_colour(p, LIMIT_WARN, LIMIT_HOT)
             seg = muted(tag) + " "
-            if limit_w and tag == "5h":      # 7d barely moves within a session: text is enough
+            if limit_w and i == 0:           # the first window present binds first: 5h, else 7d
                 seg += gauge(p / 100, limit_w, c) + " "
             seg += paint(f"{p}%", c)
-            if tag == "5h" and p >= LIMIT_HOT:
+            if p >= LIMIT_HOT:
                 try:
                     resets = int(num(w.get("resets_at"), 0))
                     if resets > 0:
-                        seg += " " + paint("⟳ " + datetime.fromtimestamp(resets).strftime("%H:%M"), c)
+                        seg += " " + paint("⟳ " + datetime.fromtimestamp(resets).strftime(when), c)
                 except (OverflowError, OSError, ValueError):
                     pass
             parts.append(seg)

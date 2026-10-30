@@ -27,6 +27,8 @@ DRAWN_GLYPHS = set("█▌▓░│·−…↑↓◷⟳▸✓✗")
 FALLBACK_GLYPHS = set("◷⟳")
 GAUGE_GLYPHS = set("█▌▓░")
 GIT = {"branch": "main", "dirty": True, "ahead": 2, "behind": 1}
+# A verified Ultra account: no 5-hour window, only the weekly one.
+ULTRA = {"seven_day": {"used_percentage": 41.2, "resets_at": 1787500000}}
 
 
 def payload(**over):
@@ -69,7 +71,7 @@ def context(tokens, window=1_000_000):
 
 
 def context_gauge(text):
-    """The first run of gauge glyphs: the context gauge, which precedes the 5h gauge."""
+    """The first run of gauge glyphs: the context gauge, which precedes the limit gauge."""
     visible = strip(text)
     start = next(i for i, ch in enumerate(visible) if ch in GAUGE_GLYPHS)
     end = start
@@ -274,17 +276,47 @@ class RateLimits(unittest.TestCase):
         self.assertNotIn("⟳", strip(render_at(120, rate_limits=limits(84.4))))
         self.assertIn("⟳ ", strip(render_at(120, rate_limits=limits(84.6))))
 
-    def test_only_the_five_hour_limit_gets_a_gauge(self):
+    def test_five_hour_limit_gets_the_gauge_when_present(self):
         out = strip(render_at(240))
         five, seven = out.split("5h", 1)[1].split("7d", 1)
         self.assertIn("█", five)
         self.assertNotIn("█", seven.split("│")[0])
         self.assertNotIn("░", seven.split("│")[0])
 
+    def test_seven_day_limit_gets_the_gauge_without_a_five_hour_window(self):
+        # Verified Ultra accounts have no 5-hour limit: the weekly one is the one that binds.
+        out = strip(render_at(240, rate_limits=ULTRA))
+        self.assertNotIn("5h", out)
+        self.assertRegex(out.split("│")[3], r"^ 7d [█░]+ 41%")
+
+    def test_limit_gauge_keeps_its_tier_width_for_either_window(self):
+        for cols in (175, 181, 187, 240):
+            _, limit_w = statusline.gauge_widths(cols)
+            for limits, tag in ((None, "5h"), (ULTRA, "7d")):
+                over = {"rate_limits": limits} if limits else {}
+                seg = strip(render_at(cols, **over)).split(tag + " ", 1)[1]
+                self.assertEqual(len(seg.split(" ", 1)[0]), limit_w, (cols, tag))
+
     def test_malformed_five_hour_keeps_the_seven_day_limit(self):
         out = strip(render_at(200, rate_limits={
             "five_hour": "nope", "seven_day": {"used_percentage": 41.2}}))
-        self.assertIn("7d 41%", out)
+        self.assertRegex(out, r"7d [█░]+ 41%")
+
+    def test_seven_day_reset_shows_the_weekday(self):
+        hot = {"used_percentage": 88, "resets_at": 1787500000}
+        for limits in ({"seven_day": hot},
+                       {"five_hour": {"used_percentage": 10, "resets_at": 1787000000}, "seven_day": hot}):
+            out = strip(render_at(240, rate_limits=limits))
+            self.assertRegex(out, r"7d .*88% ⟳ (Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d\d:\d\d")
+
+    def test_five_hour_reset_shows_only_the_time(self):
+        out = strip(render_at(240, rate_limits={"five_hour": {"used_percentage": 95, "resets_at": 1787000000}}))
+        self.assertRegex(out, r"95% ⟳ \d\d:\d\d")
+        self.assertNotRegex(out, r"⟳ [A-Z][a-z]{2} ")
+
+    def test_limits_take_less_room_without_a_five_hour_window(self):
+        self.assertLess(statusline.visible_len(render_at(240, rate_limits=ULTRA)),
+                        statusline.visible_len(render_at(240)))
 
 
 class Colour(unittest.TestCase):
@@ -305,9 +337,12 @@ class Layout(unittest.TestCase):
         long = dict(session_name="a very long session name indeed",
                     context_window=context(262_000), cost={"total_cost_usd": 123.45,
                     "total_duration_ms": 36_000_000, "total_lines_added": 4000, "total_lines_removed": 900})
-        for cols in range(70, 260):
-            width = statusline.visible_len(render_at(cols, **long))
-            self.assertLessEqual(width, cols - statusline.RESERVE, cols)
+        hot = {"used_percentage": 95, "resets_at": 1787000000}
+        for limits in (None, {"seven_day": hot}, {"five_hour": hot, "seven_day": hot}):
+            over = dict(long, rate_limits=limits) if limits else long
+            for cols in range(70, 260):
+                width = statusline.visible_len(render_at(cols, **over))
+                self.assertLessEqual(width, cols - statusline.RESERVE, (cols, limits))
 
     def test_directory_comes_before_the_session_name(self):
         with mock.patch.object(statusline, "git_info", return_value=GIT):
@@ -351,7 +386,9 @@ class Glyphs(unittest.TestCase):
                 self.assert_known_glyphs(render_at(cols, context_window=context(262_000),
                                                    session_name="x" * 40,
                                                    rate_limits={"five_hour": {"used_percentage": 95,
-                                                                              "resets_at": 1787000000}}))
+                                                                              "resets_at": 1787000000},
+                                                                "seven_day": {"used_percentage": 95,
+                                                                              "resets_at": 1787500000}}))
 
     def test_subagent_row_glyphs(self):
         rows = subagent_statusline.render_rows(tasks_payload(

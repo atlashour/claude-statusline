@@ -56,7 +56,7 @@ setting is re-read while a session is open.
 | Directory and git | `~/projects/webapp (main* ↑2)` | `*` for uncommitted or untracked changes, `↑` `↓` for commits ahead and behind |
 | Session name | `gateway` | Shown once the session is named with `--name` or `/rename`, or gets a generated title |
 | Context | `215k`, gauge | Tokens in use against the 400k and 500k ceilings |
-| Rate limits | `5h`, gauge, `91% ⟳ 02:26  7d 41%` | The 5-hour reset time appears from 85% |
+| Rate limits | `5h`, gauge, `91% ⟳ 02:26  7d 41%` | Each reset time appears from 85%; the weekly one with its day, `⟳ Mon 14:00` |
 | Session | `$9.40  ◷ 2h 30m  +310 −88` | Cost, elapsed time, lines added and removed |
 
 Numbers take your terminal theme's green, yellow and red. Gauges use a darker shade of
@@ -64,8 +64,9 @@ the same state so they stay quiet next to the numbers, and the model name is bol
 Claude orange. Rate limits turn yellow at 60% and red at 85%.
 
 The context gauge widens with the terminal, from 10 cells up to 25 at 181 columns, always
-a multiple of 5 so the 400k mark falls on a cell edge. The 5-hour limit gets its own gauge
-from 175 columns. Widths depend only on the terminal size, so a gauge never changes length
+a multiple of 5 so the 400k mark falls on a cell edge. From 175 columns the limit that
+binds first gets its own gauge: the 5-hour one, or the weekly one on plans without a
+5-hour limit, such as a verified Ultra account. Widths depend only on the terminal size, so a gauge never changes length
 between refreshes. The line stops 4 columns short of the terminal width, which Claude Code
 keeps for its own margins.
 
