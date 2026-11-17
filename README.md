@@ -105,12 +105,15 @@ inherited the session's.
 ```
 python -X utf8 test_statusline.py
 claude plugin test .
+tsc -p . --noEmit
 ```
 
 The Python suite uses only the standard library, so it runs anywhere the status line
 does. It covers line width, colours, the symbols drawn, the subagent rows, and malformed
 input, which may drop its own segment but never the line. The plugin suite covers the
-mod: one script run per snapshot, and Claude Code's own rows when Python fails.
+mod: one script run per snapshot, and Claude Code's own rows when Python fails. `tsc`
+type-checks the mod against the types Claude Code writes into `.claude-plugin/types/`
+once it has loaded the mod.
 
 ## Details
 

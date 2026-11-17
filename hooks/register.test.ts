@@ -12,6 +12,10 @@ function agent(id: string, over: Partial<AgentInfo> = {}): AgentInfo {
 
 const AGENTS = [agent('a'), agent('b', { status: 'completed' })]
 
+function exited(stdout: string) {
+  return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+}
+
 function row(id: string) {
   return {
     surface: 'terminal', component: 'AgentRow', requestId: id,
@@ -25,10 +29,10 @@ test('one script run draws every row of a snapshot', async ($, on) => {
   on('agent.list', () => ({ value: AGENTS }))
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
   on('process.run', (_, e) => {
-    runs.push({ argv: e.argv, stdin: e.init?.stdin as string | undefined })
-    const out = JSON.parse(e.init!.stdin as string).tasks
+    runs.push({ argv: e.argv, stdin: e.init?.stdin })
+    const out = JSON.parse(e.init?.stdin ?? '{}').tasks
       .map((t: AgentInfo) => JSON.stringify({ id: t.id, content: `row ${t.id}` })).join('\n')
-    return { value: { exitCode: 0, stdout: out + '\n', stderr: '' } }
+    return exited(out + '\n')
   })
   on('ui.render', { component: 'AgentRow' }, (_, e, next) => {
     bodies[e.requestId] = e.props.body
@@ -39,8 +43,8 @@ test('one script run draws every row of a snapshot', async ($, on) => {
 
   expect(bodies).toEqual({ a: 'row a', b: 'row b' })
   expect(runs.length).toBe(1)
-  expect(runs[0].argv.slice(1)).toEqual(['-X', 'utf8', '/plugin/subagent_statusline.py'])
-  expect(JSON.parse(runs[0].stdin!).columns).toBe(100)
+  expect(runs[0]?.argv.slice(1)).toEqual(['-X', 'utf8', '/plugin/subagent_statusline.py'])
+  expect(JSON.parse(runs[0]?.stdin ?? '{}').columns).toBe(100)
 })
 
 test('the row is named by the agent name, else its type, never the description', async ($, on) => {
@@ -48,8 +52,8 @@ test('the row is named by the agent name, else its type, never the description',
   on('agent.list', () => ({ value: [agent('a', { name: 'red-team' }), agent('b')] }))
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
   on('process.run', (_, e) => {
-    labels = JSON.parse(e.init!.stdin as string).tasks.map((t: AgentInfo) => t.label)
-    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    labels = JSON.parse(e.init?.stdin ?? '{}').tasks.map((t: AgentInfo) => t.label)
+    return exited('')
   })
   on('ui.render', { component: 'AgentRow' }, (_, e, next) => next(e))
 
@@ -64,7 +68,7 @@ test('without a working Python the engine keeps its own row', async ($, on) => {
   on('agent.list', () => ({ value: AGENTS }))
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
   on('process.run', (_, e) => {
-    tried.push(e.argv[0])
+    tried.push(e.argv[0] ?? '')
     throw new Error('not found')
   })
   on('ui.render', { component: 'AgentRow' }, (_, e, next) => {
