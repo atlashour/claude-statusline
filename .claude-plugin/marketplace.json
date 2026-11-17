@@ -1,0 +1,6 @@
+{
+  "name": "the-claude-statusline",
+  "description": "Subagent rows with a context gauge measured against absolute ceilings, not the window",
+  "owner": { "name": "Atlashour" },
+  "plugins": [{ "name": "the-claude-statusline", "source": "./" }]
+}

@@ -597,6 +597,61 @@ class SubagentRows(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn(statusline.VERSION, r.stdout)
 
+    def test_killed_task_is_a_red_cross_not_pending(self):
+        row = json.loads(subagent_statusline.render_rows(tasks_payload(a_task(status="killed")))[0])["content"]
+        self.assertIn(f"\033[{statusline.RED}m✗", row)
+
+    def test_waiting_and_idle_tasks_get_their_own_glyph(self):
+        for status in ("waiting", "idle"):
+            row = strip(json.loads(subagent_statusline.render_rows(
+                tasks_payload(a_task(status=status)))[0])["content"])
+            self.assertTrue(row.startswith("◦ "), (status, row))
+
+    def test_short_model_strips_provider_prefixes_and_suffixes(self):
+        cases = {
+            "claude-opus-5": "opus-5",
+            "claude-haiku-4-5-20251001": "haiku-4-5",
+            "claude-opus-5[1m]": "opus-5",
+            "anthropic.claude-haiku-4-5-20251001-v1:0": "haiku-4-5",
+            "us.anthropic.claude-opus-5-v1:0": "opus-5",
+            "global.anthropic.claude-sonnet-5-5-v1": "sonnet-5-5",
+            "claude-opus-4-5@20251101": "opus-4-5",
+            "publishers/anthropic/models/claude-fable-5-2": "fable-5-2",
+        }
+        for raw, short in cases.items():
+            self.assertEqual(subagent_statusline.short_model(raw), short, raw)
+
+    def test_negative_columns_fall_back_to_the_default(self):
+        rows = subagent_statusline.render_rows(tasks_payload(a_task(description="d" * 300), columns=-5))
+        self.assertLessEqual(statusline.visible_len(json.loads(rows[0])["content"]),
+                             subagent_statusline.FALLBACK_COLS)
+
+    def test_rows_never_load_the_git_modules(self):
+        code = ("import sys, json, io; sys.path.insert(0, sys.argv[1]);"
+                "import subagent_statusline;"
+                "print(json.dumps([m for m in ('subprocess', 'tempfile', 'datetime') if m in sys.modules]))")
+        r = subprocess.run([sys.executable, "-X", "utf8", "-S", "-c", code, HERE],
+                           capture_output=True, encoding="utf-8", timeout=10)
+        self.assertEqual(json.loads(r.stdout), [], r.stderr)
+
+    def test_old_git_caches_are_swept_and_fresh_ones_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            names = {"old": statusline.GIT_CACHE_PREFIX + "old.json",
+                     "new": statusline.GIT_CACHE_PREFIX + "new.json", "other": "unrelated.json"}
+            for name in names.values():
+                open(os.path.join(d, name), "w").close()
+            now = 2_000_000_000
+            old = now - statusline.GIT_CACHE_MAX_AGE - 60
+            os.utime(os.path.join(d, names["old"]), (old, old))
+            os.utime(os.path.join(d, names["other"]), (old, old))
+            os.utime(os.path.join(d, names["new"]), (now, now))
+            statusline.sweep_git_caches(d, now=now)
+            self.assertEqual(sorted(os.listdir(d)), sorted([names["new"], names["other"]]))
+
+    def test_plugin_manifest_version_matches(self):
+        with open(os.path.join(HERE, ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["version"], statusline.VERSION)
+
 
 # --- encoding -----------------------------------------------------------------------
 

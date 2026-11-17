@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Subagent status line: one row per visible subagent in the agent panel.
 
-Row, left to right: status (▸ running, · pending, ✓ done, ✗ failed), label, model and
+Row, left to right: status (▸ running, · pending, ◦ waiting or idle, ✓ done, ✗ failed or
+killed), label, model and
 explicit effort, tokens and context gauge, description. The gauge is the main line's: the
 same two ceilings, clamped to the task's own window.
 
@@ -24,6 +25,7 @@ Python 3.7+, standard library only.
 import json
 import math
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,8 +85,9 @@ FALLBACK_COLS = 80
 MAX_TOKENS = 999_000_000
 GAUGE_CELLS = 5 + BAR_W          # count right-aligned in 4 cells, space, gauge
 STATUS = {"running": ("▸", None), "pending": ("·", None), "queued": ("·", None),
+          "waiting": ("◦", None), "idle": ("◦", None),
           "completed": ("✓", GREEN), "done": ("✓", GREEN),
-          "failed": ("✗", RED), "error": ("✗", RED)}
+          "failed": ("✗", RED), "error": ("✗", RED), "killed": ("✗", RED)}
 
 
 def short_model(model_id: str) -> str:
@@ -93,9 +96,10 @@ def short_model(model_id: str) -> str:
     if not m:
         return ""
     m = m.split("/")[-1]                              # bedrock/vertex prefixes
-    for prefix in ("anthropic.", "claude-", "us.anthropic.claude-"):
-        if m.startswith(prefix):
-            m = m[len(prefix):]
+    m = re.sub(r"\[[^\]]*\]$", "", m)                 # [1m] context tag
+    m = re.sub(r"@\d{8}$", "", m)                     # vertex @20251001 stamp
+    m = re.sub(r"-v\d+(:\d+)?$", "", m)               # bedrock -v1:0 revision
+    m = re.sub(r"^(?:[a-z]{2,6}\.)?(?:anthropic\.)?(?:claude-)?", "", m)   # us./global.anthropic.claude-
     parts = m.split("-")
     if len(parts) > 1 and parts[-1].isdigit() and len(parts[-1]) == 8:
         parts = parts[:-1]                            # drop a 20251001 stamp
@@ -172,7 +176,7 @@ def render_rows(d: dict) -> list:
     if not isinstance(d, dict):
         return []
     try:
-        columns = int(num(d.get("columns"), FALLBACK_COLS)) or FALLBACK_COLS
+        columns = max(0, int(num(d.get("columns"), FALLBACK_COLS))) or FALLBACK_COLS
     except Exception:
         columns = FALLBACK_COLS
     tasks = d.get("tasks") if isinstance(d.get("tasks"), list) else []

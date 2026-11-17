@@ -44,15 +44,14 @@ Input: the statusLine JSON on stdin. Output: one line. Python 3.7+, standard lib
 import json
 import math
 import os
-import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
-from datetime import datetime
+# subprocess and tempfile load inside the git helpers: the subagent rows import this
+# module on every refresh and never touch git.
 
 # --- Tunables ----------------------------------------------------------------
-VERSION       = "6.1.0"  # reported by --version; never drawn on the line
+VERSION       = "6.2.0"  # reported by --version; never drawn on the line
 SESSION_MAX   = 20       # display cells allowed to the session name
 MODEL_MAX     = 40       # display cells allowed to the model name (it never drops)
 CEILING_ABS   = 500_000  # absolute context ceiling (tokens): red from here, the gauge's end
@@ -82,8 +81,10 @@ MAX_TOKENS = 999_000_000
 TAIL = ("cost", "duration", "lines")
 COUNT_CELLS = 4                # "999k", "1.2M", "999M": the gauge never shifts as it grows
 
-# Keep the git subprocess from flashing a console window on Windows.
-_NOWINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+# Keep the git subprocess from flashing a console window on Windows (CREATE_NO_WINDOW).
+_NOWINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
+GIT_CACHE_PREFIX = "claude-statusline-git-"
+GIT_CACHE_MAX_AGE = 7 * 86_400   # a session's cache older than this is swept
 
 
 def num(x, default=0.0):
@@ -246,6 +247,7 @@ def gauge_widths(cols: int):
 
 def _git(cwd: str, *args: str):
     try:
+        import subprocess
         return subprocess.run(
             ["git", "-C", cwd, "--no-optional-locks", *args],
             capture_output=True, encoding="utf-8", errors="replace",
@@ -291,6 +293,23 @@ def _git_status_live(cwd: str):
     return {"branch": branch, "dirty": dirty, "ahead": ahead, "behind": behind} if branch else None
 
 
+def sweep_git_caches(tmpdir: str, now=None) -> None:
+    """Remove git caches of sessions untouched for GIT_CACHE_MAX_AGE. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        with os.scandir(tmpdir) as entries:
+            for entry in entries:
+                if not entry.name.startswith(GIT_CACHE_PREFIX):
+                    continue
+                try:
+                    if now - entry.stat().st_mtime > GIT_CACHE_MAX_AGE:
+                        os.remove(entry.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def git_info(cwd: str, session_id: str):
     """Git state cached per session for GIT_TTL seconds, invalidated when cwd changes.
 
@@ -303,12 +322,16 @@ def git_info(cwd: str, session_id: str):
     if not sid:
         return _git_status_live(cwd)
 
-    cache = os.path.join(tempfile.gettempdir(), f"claude-statusline-git-{sid}.json")
+    import tempfile
+    tmpdir = tempfile.gettempdir()
+    cache = os.path.join(tmpdir, f"{GIT_CACHE_PREFIX}{sid}.json")
     try:
         with open(cache, "r", encoding="utf-8") as f:
             c = json.load(f)
         if c.get("cwd") == cwd and time.time() - os.path.getmtime(cache) < GIT_TTL:
             return c.get("info")
+    except FileNotFoundError:
+        sweep_git_caches(tmpdir)       # a new session: clear what old ones left behind
     except Exception:
         pass
 
@@ -407,7 +430,7 @@ def render(d: dict) -> str:
                 try:
                     resets = int(num(w.get("resets_at"), 0))
                     if resets > 0:
-                        seg += " " + paint("⟳ " + datetime.fromtimestamp(resets).strftime(when), c)
+                        seg += " " + paint("⟳ " + time.strftime(when, time.localtime(resets)), c)
                 except (OverflowError, OSError, ValueError):
                     pass
             parts.append(seg)

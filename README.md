@@ -26,9 +26,10 @@ never shows `400k` before 400k is reached.
 
 ## Install
 
-Requires Python 3.7 or later and Claude Code 2.1.153 or later. No dependencies.
+Requires Python 3.7 or later. No dependencies.
 
-Clone the repository, then point `~/.claude/settings.json` at it:
+The status line is a command. Clone the repository, then point `~/.claude/settings.json`
+at it (Claude Code 2.1.153 or later):
 
 ```json
 {
@@ -37,16 +38,23 @@ Clone the repository, then point `~/.claude/settings.json` at it:
     "command": "python -X utf8 /path/to/claude-statusline/statusline.py",
     "padding": 0,
     "refreshInterval": 10
-  },
-  "subagentStatusLine": {
-    "type": "command",
-    "command": "python -X utf8 /path/to/claude-statusline/subagent_statusline.py"
   }
 }
 ```
 
-On Windows, write the path with forward slashes. Restart Claude Code afterwards; neither
-setting is re-read while a session is open.
+On Windows, write the path with forward slashes. Restart Claude Code afterwards; the
+setting is not re-read while a session is open.
+
+The subagent rows are a mod. Install it at the prompt of a terminal session, answering
+`y` to add the marketplace and then picking a scope:
+
+```
+/plugin install the-claude-statusline --marketplace Atlashour/claude-statusline
+```
+
+The mod runs the same Python, so the rows need it on `PATH` as `python`, `python3` or
+`py`. If your settings still hold a `subagentStatusLine` entry from an earlier version,
+remove it: that setting is deprecated in favour of mods, and the mod takes its place.
 
 ## The status line
 
@@ -77,26 +85,32 @@ shows a name set with `--name` or `/rename` on its prompt bar.
 
 ## Subagent rows
 
-`subagent_statusline.py` replaces the default rows in the agent panel. Each row shows a
-status mark (`▸` running, `·` pending, `✓` done, `✗` failed), the label, the model and
-any explicit effort, the tokens used with the same context gauge as the main line, and
-the description. The ceilings are capped by that agent's own window. Columns line up
-across rows while the panel is wide enough.
+The `the-claude-statusline` mod replaces the default rows in the agent panel with rows drawn by
+`subagent_statusline.py`. Each row shows a status mark (`▸` running, `·` pending, `◦`
+waiting or idle, `✓` done, `✗` failed or stopped), the label, the model and any explicit
+effort, the tokens used with the same context gauge as the main line, and the
+description. The ceilings are capped by that agent's own window. Columns line up across
+rows while the panel is wide enough.
 
-The gauge appears once the agent's model is known, which needs Claude Code 2.1.205;
-until then the row shows the token count alone.
-Effort appears only when it was set explicitly, which needs 2.1.214; no effort means the
-agent inherited the session's.
+The script runs once per change of the agent list, not once per row, and takes about a
+tenth of a second. If Python is missing or the script fails, the panel keeps Claude
+Code's own rows.
+
+The gauge appears once the agent's model is known; until then the row shows the token
+count alone. Effort appears only when it was set explicitly; no effort means the agent
+inherited the session's.
 
 ## Tests
 
 ```
 python -X utf8 test_statusline.py
+claude plugin test .
 ```
 
-The suite uses only the standard library, so it runs anywhere the status line does. It
-covers line width, colours, the symbols drawn, the subagent rows, and malformed input,
-which may drop its own segment but never the line.
+The Python suite uses only the standard library, so it runs anywhere the status line
+does. It covers line width, colours, the symbols drawn, the subagent rows, and malformed
+input, which may drop its own segment but never the line. The plugin suite covers the
+mod: one script run per snapshot, and Claude Code's own rows when Python fails.
 
 ## Details
 
@@ -105,7 +119,8 @@ which may drop its own segment but never the line.
   followed by a space, so a wider fallback glyph cannot overlap the next character.
 - `git status` runs at most once every 5 seconds per session.
 - `python statusline.py --version` prints the installed version. Bump `VERSION` in
-  `statusline.py` whenever either script changes.
+  `statusline.py` and `version` in `.claude-plugin/plugin.json` together whenever
+  anything changes; a test holds them equal.
 
 ## License
 

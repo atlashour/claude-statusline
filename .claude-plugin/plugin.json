@@ -1,0 +1,8 @@
+{
+  "name": "the-claude-statusline",
+  "version": "6.2.0",
+  "description": "Subagent rows with the claude-statusline context gauge, drawn by subagent_statusline.py",
+  "author": { "name": "Atlashour" },
+  "license": "MIT",
+  "repository": "https://github.com/Atlashour/claude-statusline"
+}
